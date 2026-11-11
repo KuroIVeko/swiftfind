@@ -109,6 +109,12 @@ impl TextInput {
         self.select_to(self.next_boundary(self.cursor_offset()), window, cx);
     }
 
+    /// Selects the whole text (so typing replaces the previous query).
+    pub fn select_all_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, window, cx);
+        self.select_to(self.content.len(), window, cx)
+    }
+
     fn select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, window, cx);
         self.select_to(self.content.len(), window, cx)

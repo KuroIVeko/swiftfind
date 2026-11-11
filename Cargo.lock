@@ -4304,10 +4304,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures",
  "gpui",
  "gpui_platform",
  "memchr",
  "parking_lot",
+ "raw-window-handle",
  "rayon",
  "unicode-segmentation",
  "windows 0.62.2",

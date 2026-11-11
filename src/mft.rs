@@ -4,7 +4,7 @@
 //! large unbuffered chunks while worker threads parse the chunks already read.
 //! The caller falls back to the ioctl if anything here looks unexpected.
 
-use crate::index::{VolumeMeta, VolumeScan};
+use crate::index::{Stat, VolumeMeta, VolumeScan};
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::Mutex;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -20,6 +20,7 @@ const CHUNK: usize = 4 << 20;
 /// Chunk buffers in flight (being read or parsed): bounds memory to 32 MB.
 const BUFFERS: usize = 8;
 
+const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
@@ -159,13 +160,38 @@ fn to_utf16(b: &[u8]) -> impl Iterator<Item = u16> + '_ {
     b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]))
 }
 
+/// What an extension record contributes to its base record.
+struct Ext {
+    base: u64,
+    name: Option<Name>,
+    size: Option<u64>,
+}
+
+/// A base record that has an `$ATTRIBUTE_LIST`, so its best name or its
+/// `$DATA` may live in extension records; resolved after the whole MFT is read.
+struct Pending {
+    rec: u64,
+    is_dir: bool,
+    name: Option<Name>,
+    size: Option<u64>,
+    mtime: u32,
+}
+
 /// Output of parsing one chunk.
 struct Chunk {
     scan: VolumeScan,
-    /// Base records whose best name may live in an extension record.
-    pending: Vec<(u64, bool, Option<Name>)>,
-    /// Names found in extension records, keyed by base record number.
-    ext: Vec<(u64, Name)>,
+    pending: Vec<Pending>,
+    ext: Vec<Ext>,
+}
+
+/// Logical size from the unnamed `$DATA` attribute (only its first segment
+/// carries the size if it is non-resident).
+fn data_size(a: &[u8], non_resident: bool) -> Option<u64> {
+    if non_resident {
+        (u64_at(a, 0x10)? == 0).then(|| u64_at(a, 0x30)).flatten()
+    } else {
+        Some(u32_at(a, 0x10)? as u64)
+    }
 }
 
 fn parse_chunk(buf: &mut [u8], record_size: usize, first_rec: u64, count: usize) -> Chunk {
@@ -186,8 +212,15 @@ fn parse_chunk(buf: &mut [u8], record_size: usize, first_rec: u64, count: usize)
         let base = u64_at(rec, 0x20).unwrap_or(0) & 0x0000_FFFF_FFFF_FFFF;
         let mut best: Option<(u8, u64, &[u8])> = None;
         let mut has_list = false;
-        for (ty, non_resident, _, a) in attributes(rec) {
+        let mut size = None;
+        let mut mtime = 0;
+        for (ty, non_resident, name_len, a) in attributes(rec) {
             match ty {
+                ATTR_STANDARD_INFORMATION if !non_resident => {
+                    if let Some(ft) = resident_value(a).and_then(|v| u64_at(v, 0x08)) {
+                        mtime = Stat::mtime_from_filetime(ft);
+                    }
+                }
                 ATTR_ATTRIBUTE_LIST => has_list = true,
                 ATTR_FILE_NAME if !non_resident => {
                     if let Some(n) = file_name(a)
@@ -196,20 +229,22 @@ fn parse_chunk(buf: &mut [u8], record_size: usize, first_rec: u64, count: usize)
                         best = Some(n);
                     }
                 }
+                ATTR_DATA if name_len == 0 && size.is_none() => size = data_size(a, non_resident),
                 _ => {}
             }
         }
         let is_dir = flags & RECORD_IS_DIR != 0;
         let owned = |(rank, parent, name): (u8, u64, &[u8])| Name { rank, parent, utf16: to_utf16(name).collect() };
         if base != 0 {
-            // Extension record: its names belong to the base record.
-            if let Some(n) = best {
-                out.ext.push((base, owned(n)));
+            // Extension record: its names and data belong to the base record.
+            if best.is_some() || size.is_some() {
+                out.ext.push(Ext { base, name: best.map(owned), size });
             }
-        } else if has_list && best.is_none_or(|b| b.0 < 3) {
-            out.pending.push((rec_no, is_dir, best.map(owned)));
+        } else if has_list && (best.is_none_or(|b| b.0 < 3) || (size.is_none() && !is_dir)) {
+            out.pending.push(Pending { rec: rec_no, is_dir, name: best.map(owned), size, mtime });
         } else if let Some((_, parent, name)) = best {
-            out.scan.push_utf16(rec_no, parent, to_utf16(name), is_dir);
+            let size = if is_dir { u64::MAX } else { size.unwrap_or(u64::MAX) };
+            out.scan.push_utf16(rec_no, parent, to_utf16(name), is_dir, Stat { size, mtime });
         }
     }
     out
@@ -221,8 +256,8 @@ struct Merger {
     next: usize,
     waiting: BTreeMap<usize, Chunk>,
     scan: VolumeScan,
-    pending: Vec<(u64, bool, Option<Name>)>,
-    ext: Vec<(u64, Name)>,
+    pending: Vec<Pending>,
+    ext: Vec<Ext>,
 }
 
 impl Merger {
@@ -346,22 +381,27 @@ pub fn scan(h: HANDLE, geo: &NTFS_VOLUME_DATA_BUFFER, letter: char, meta: Volume
     read_result?;
 
     let Merger { mut scan, pending, ext, .. } = merger.into_inner();
-    // Rare: files with so many attributes that their names spilled into
-    // extension records.
-    let mut ext_best: HashMap<u64, Name> = HashMap::new();
-    for (base, n) in ext {
-        let slot = ext_best.entry(base).or_insert_with(|| n.clone());
-        if n.rank > slot.rank {
-            *slot = n;
+    // Rare: files with so many attributes that their names or data spilled
+    // into extension records.
+    let mut ext_best: HashMap<u64, (Option<Name>, Option<u64>)> = HashMap::new();
+    for e in ext {
+        let slot = ext_best.entry(e.base).or_default();
+        if let Some(n) = e.name
+            && slot.0.as_ref().is_none_or(|s| n.rank > s.rank)
+        {
+            slot.0 = Some(n);
         }
+        slot.1 = slot.1.or(e.size);
     }
-    for (rec, is_dir, own) in pending {
-        let best = match (own, ext_best.remove(&rec)) {
+    for p in pending {
+        let (ext_name, ext_size) = ext_best.remove(&p.rec).unwrap_or_default();
+        let name = match (p.name, ext_name) {
             (Some(a), Some(b)) => Some(if b.rank > a.rank { b } else { a }),
             (a, b) => a.or(b),
         };
-        if let Some(n) = best {
-            scan.push_utf16(rec, n.parent, n.utf16.into_iter(), is_dir);
+        if let Some(n) = name {
+            let size = if p.is_dir { u64::MAX } else { p.size.or(ext_size).unwrap_or(u64::MAX) };
+            scan.push_utf16(p.rec, n.parent, n.utf16.into_iter(), p.is_dir, Stat { size, mtime: p.mtime });
         }
     }
     drop_metafiles(&mut scan);

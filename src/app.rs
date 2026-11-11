@@ -1,20 +1,25 @@
-//! Main window: search box, virtualized result list and status bar.
+//! Main window: search box, sortable virtualized result list, context menu
+//! and status bar.
 
-use crate::index::Query;
+use crate::index::{Query, SortKey, Stat};
 use crate::indexer::Shared;
 use crate::os;
 use crate::text_input::{self, Changed, TextInput};
 use gpui::{
-    App, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
-    MouseDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window, actions, div,
-    prelude::*, px, rgb, uniform_list,
+    App, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding,
+    MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*, px, rgb,
+    uniform_list,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-actions!(swiftfind, [SelectNext, SelectPrev, SelectFirst, SelectLast, OpenSelected, RevealSelected]);
+actions!(
+    swiftfind,
+    [SelectNext, SelectPrev, SelectFirst, SelectLast, OpenSelected, RevealSelected, CopyPath, Dismiss]
+);
 
 pub fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
@@ -25,6 +30,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-end", SelectLast, Some("SwiftFind")),
         KeyBinding::new("enter", OpenSelected, Some("SwiftFind")),
         KeyBinding::new("ctrl-enter", RevealSelected, Some("SwiftFind")),
+        KeyBinding::new("ctrl-shift-c", CopyPath, Some("SwiftFind")),
+        KeyBinding::new("escape", Dismiss, Some("SwiftFind")),
     ]);
 }
 
@@ -32,13 +39,20 @@ const ROW_H: f32 = 24.;
 const COL_SIZE: f32 = 100.;
 const COL_DATE: f32 = 150.;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Row {
     name: SharedString,
     path: SharedString,
     full: Arc<str>,
     size: SharedString,
     modified: SharedString,
+}
+
+/// Open context menu for one result.
+#[derive(Clone)]
+struct Menu {
+    position: Point<Pixels>,
+    row: Row,
 }
 
 pub struct SwiftFindApp {
@@ -57,11 +71,16 @@ pub struct SwiftFindApp {
     result_epoch: u64,
     rows: HashMap<u32, Row>,
     rows_gen: u64,
+    sort: SortKey,
+    sort_desc: bool,
+    menu: Option<Menu>,
+    /// Shown in the status bar (e.g. hotkey registration failure).
+    notice: Option<String>,
     focus_handle: FocusHandle,
 }
 
 impl SwiftFindApp {
-    pub fn new(shared: Arc<Shared>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(shared: Arc<Shared>, notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("搜索文件名…（空格分隔多个关键词，支持 * ? 通配符）", cx));
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
             this.selected = None;
@@ -103,6 +122,10 @@ impl SwiftFindApp {
             result_epoch: u64::MAX,
             rows: HashMap::new(),
             rows_gen: u64::MAX,
+            sort: SortKey::Name,
+            sort_desc: false,
+            menu: None,
+            notice,
             focus_handle: cx.focus_handle(),
         };
         this.search(cx);
@@ -114,14 +137,16 @@ impl SwiftFindApp {
         let latest = self.search_seq.clone();
         let shared = self.shared.clone();
         let query = self.input.read(cx).text().to_string();
+        let (sort, desc) = (self.sort, self.sort_desc);
         self.searching = true;
         let task = cx.background_executor().spawn(async move {
             let t = Instant::now();
             let index = shared.index.read();
             let generation = index.generation.load(Ordering::Relaxed);
             let epoch = index.epoch;
-            let res = index.search(&Query::parse(&query), &|| latest.load(Ordering::Relaxed) != seq);
-            res.map(|r| (r, generation, epoch, t.elapsed()))
+            let mut res = index.search(&Query::parse(&query), &|| latest.load(Ordering::Relaxed) != seq)?;
+            index.sort_results(&mut res, sort, desc);
+            Some((res, generation, epoch, t.elapsed()))
         });
         cx.spawn(async move |this, cx| {
             let res = task.await;
@@ -146,6 +171,27 @@ impl SwiftFindApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Focuses the search box with its text selected (after the window is shown).
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        window.focus(&self.input.focus_handle(cx), cx);
+        self.input.update(cx, |input, cx| input.select_all_text(window, cx));
+    }
+
+    /// Header click: same column flips direction; a new column starts
+    /// ascending (name/path) or descending (size/date, biggest/newest first).
+    fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
+        if self.sort == key {
+            self.sort_desc = !self.sort_desc;
+        } else {
+            self.sort = key;
+            self.sort_desc = matches!(key, SortKey::Size | SortKey::Modified);
+        }
+        self.selected = None;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.search(cx);
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -194,6 +240,18 @@ impl SwiftFindApp {
         }
     }
 
+    fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = self.selected_path() {
+            cx.write_to_clipboard(ClipboardItem::new_string(p));
+        }
+    }
+
+    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Builds (and caches) display data for the given result rows.
     fn rows_for(&mut self, range: std::ops::Range<usize>) -> Vec<Option<Row>> {
         let wanted: Vec<u32> = self.results[range.clone()].to_vec();
@@ -215,15 +273,13 @@ impl SwiftFindApp {
                 }
                 let full = index.full_path(e);
                 let is_dir = index.is_dir(e);
-                let meta = std::fs::symlink_metadata(&full).ok();
-                let size = match (&meta, is_dir) {
-                    (Some(m), false) => format_size(m.len()),
-                    _ => String::new(),
-                };
-                let modified = meta
-                    .and_then(|m| m.modified().ok())
-                    .map(format_time)
-                    .unwrap_or_default();
+                let mut stat = index.stat(e);
+                // Not known when the volume was scanned via the slow fallback.
+                if stat.mtime == 0 || (!is_dir && stat.size == u64::MAX) {
+                    stat = Stat::from_fs(&full).unwrap_or(stat);
+                }
+                let size = if is_dir || stat.size == u64::MAX { String::new() } else { format_size(stat.size) };
+                let modified = format_time(stat.mtime);
                 self.rows.insert(
                     e,
                     Row {
@@ -256,17 +312,110 @@ fn format_size(bytes: u64) -> String {
     out + " KB"
 }
 
-fn format_time(t: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Local> = t.into();
-    dt.format("%Y-%m-%d %H:%M").to_string()
+fn format_time(unix: u32) -> String {
+    use chrono::TimeZone;
+    if unix == 0 {
+        return String::new();
+    }
+    match chrono::Local.timestamp_opt(unix as i64, 0) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        chrono::LocalResult::None => String::new(),
+    }
 }
 
-fn header_cell(text: &'static str) -> gpui::Div {
-    div().px_2().overflow_hidden().whitespace_nowrap().child(text)
+fn menu_item(
+    id: &'static str,
+    label: &'static str,
+    shortcut: &'static str,
+    cx: &mut Context<SwiftFindApp>,
+    action: impl Fn(&Row, &mut Context<SwiftFindApp>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .justify_between()
+        .gap_6()
+        .px_3()
+        .py(px(5.))
+        .rounded_sm()
+        .hover(|s| s.bg(rgb(0xe5f3ff)))
+        .child(label)
+        .child(div().text_color(rgb(0x888888)).child(shortcut))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if let Some(menu) = this.menu.take() {
+                action(&menu.row, cx);
+            }
+            cx.notify();
+        }))
+}
+
+fn menu_separator() -> impl IntoElement {
+    div().my_1().h(px(1.)).bg(rgb(0xe5e5e5))
 }
 
 fn cell(text: SharedString) -> gpui::Div {
     div().px_2().overflow_hidden().whitespace_nowrap().text_ellipsis().child(text)
+}
+
+impl SwiftFindApp {
+    fn header_cell(&self, text: &'static str, key: SortKey, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let arrow = match (self.sort == key, self.sort_desc) {
+            (false, _) => "",
+            (true, false) => " ▲",
+            (true, true) => " ▼",
+        };
+        div()
+            .id(text)
+            .flex()
+            .flex_row()
+            .items_center()
+            .h_full()
+            .px_2()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .border_r_1()
+            .border_color(rgb(0xe2e2e2))
+            .hover(|s| s.bg(rgb(0xe5f3ff)))
+            .child(format!("{text}{arrow}"))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_sort(key, cx)))
+    }
+
+    fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
+        deferred(
+            anchored().position(menu.position).snap_to_window().child(
+                div()
+                    .id("context-menu")
+                    .occlude()
+                    .min_w(px(220.))
+                    .p_1()
+                    .bg(rgb(0xffffff))
+                    .border_1()
+                    .border_color(rgb(0xcccccc))
+                    .rounded_md()
+                    .shadow_md()
+                    .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.menu = None;
+                        cx.notify();
+                    }))
+                    .child(menu_item("m-open", "打开", "Enter", cx, |r, _| os::open(&r.full)))
+                    .child(menu_item("m-reveal", "打开所在文件夹", "Ctrl+Enter", cx, |r, _| os::reveal(&r.full)))
+                    .child(menu_separator())
+                    .child(menu_item("m-copy-full", "复制完整路径", "Ctrl+Shift+C", cx, |r, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(r.full.to_string()))
+                    }))
+                    .child(menu_item("m-copy-name", "复制名称", "", cx, |r, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(r.name.to_string()))
+                    }))
+                    .child(menu_item("m-copy-dir", "复制所在文件夹路径", "", cx, |r, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(r.path.to_string()))
+                    }))
+                    .child(menu_separator())
+                    .child(menu_item("m-props", "属性", "", cx, |r, _| os::properties(&r.full))),
+            ),
+        )
+        .with_priority(1)
+    }
 }
 
 impl Focusable for SwiftFindApp {
@@ -291,15 +440,9 @@ impl Render for SwiftFindApp {
                     .enumerate()
                     .map(|(i, row)| {
                         let ix = start + i;
-                        let row = row.unwrap_or_else(|| Row {
-                            name: "".into(),
-                            path: "".into(),
-                            full: "".into(),
-                            size: "".into(),
-                            modified: "".into(),
-                        });
+                        let row = row.unwrap_or_default();
                         let full_open = row.full.clone();
-                        let full_reveal = row.full.clone();
+                        let menu_row = row.clone();
                         let is_selected = selected == Some(ix);
                         div()
                             .id(ix)
@@ -319,10 +462,12 @@ impl Render for SwiftFindApp {
                             }))
                             .on_mouse_down(
                                 MouseButton::Right,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                     this.selected = Some(ix);
+                                    if !menu_row.full.is_empty() {
+                                        this.menu = Some(Menu { position: ev.position, row: menu_row.clone() });
+                                    }
                                     cx.notify();
-                                    os::reveal(&full_reveal);
                                 }),
                             )
                             .child(cell(row.name).flex_basis(px(0.)).flex_grow(3.).min_w_0())
@@ -346,6 +491,8 @@ impl Render for SwiftFindApp {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::reveal_selected))
+            .on_action(cx.listener(Self::copy_path))
+            .on_action(cx.listener(Self::dismiss))
             .flex()
             .flex_col()
             .size_full()
@@ -363,12 +510,13 @@ impl Render for SwiftFindApp {
                     .border_b_1()
                     .border_color(rgb(0xdddddd))
                     .text_color(rgb(0x555555))
-                    .child(header_cell("名称").flex_basis(px(0.)).flex_grow(3.).min_w_0())
-                    .child(header_cell("路径").flex_basis(px(0.)).flex_grow(5.).min_w_0())
-                    .child(header_cell("大小").w(px(COL_SIZE)).flex_none().text_right())
-                    .child(header_cell("修改时间").w(px(COL_DATE)).flex_none()),
+                    .child(self.header_cell("名称", SortKey::Name, cx).flex_basis(px(0.)).flex_grow(3.).min_w_0())
+                    .child(self.header_cell("路径", SortKey::Path, cx).flex_basis(px(0.)).flex_grow(5.).min_w_0())
+                    .child(self.header_cell("大小", SortKey::Size, cx).w(px(COL_SIZE)).flex_none().justify_end())
+                    .child(self.header_cell("修改时间", SortKey::Modified, cx).w(px(COL_DATE)).flex_none()),
             )
             .child(list)
+            .when_some(self.menu.clone(), |d, menu| d.child(self.render_menu(menu, cx)))
             .child(
                 div()
                     .flex()
@@ -383,7 +531,8 @@ impl Render for SwiftFindApp {
                     .text_color(rgb(0x555555))
                     .child(format!("{count} 个对象"))
                     .child(format!(
-                        "{status}  ·  搜索 {:.1} ms",
+                        "{}{status}  ·  搜索 {:.1} ms",
+                        self.notice.as_ref().map(|n| format!("{n}  ·  ")).unwrap_or_default(),
                         self.search_time.as_secs_f64() * 1000.
                     )),
             )

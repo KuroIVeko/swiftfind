@@ -6,17 +6,18 @@
 //! per volume:
 //!   letter u8, serial u32, root_frn u64, journal_id u64, next_usn i64,
 //!   record count u64, names byte length u64, names (UTF-8, concatenated),
-//!   records: { rec u32, parent u32, name_len u16, is_dir u8 } * count
+//!   records: { rec u32, parent u32, name_len u16, is_dir u8, size u64, mtime u32 } * count
 //! ```
 //! Names are stored back to back in record order, so offsets are implicit.
 
-use crate::index::{LiveView, VolumeMeta, VolumeScan};
+use crate::index::{LiveView, Stat, VolumeMeta, VolumeScan};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"SWFTIDX\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const RECORD_BYTES: usize = 23;
 
 pub fn cache_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
@@ -27,8 +28,8 @@ pub fn cache_path() -> PathBuf {
 pub trait CacheSource {
     fn volume_count(&self) -> usize;
     fn volume(&self, v: usize) -> (char, VolumeMeta);
-    /// Calls `f(record, parent_record, name, is_dir)` for every record.
-    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool));
+    /// Calls `f(record, parent_record, name, is_dir, stat)` for every record.
+    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool, Stat));
 }
 
 impl CacheSource for LiveView<'_> {
@@ -38,7 +39,7 @@ impl CacheSource for LiveView<'_> {
     fn volume(&self, v: usize) -> (char, VolumeMeta) {
         LiveView::volume(self, v)
     }
-    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool)) {
+    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool, Stat)) {
         LiveView::for_each(self, v, f)
     }
 }
@@ -50,10 +51,10 @@ impl CacheSource for [VolumeScan] {
     fn volume(&self, v: usize) -> (char, VolumeMeta) {
         (self[v].letter, self[v].meta)
     }
-    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool)) {
+    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool, Stat)) {
         let s = &self[v];
         for r in &s.recs {
-            f(r.rec, r.parent, s.name(r), r.is_dir);
+            f(r.rec, r.parent, s.name(r), r.is_dir, r.stat);
         }
     }
 }
@@ -77,7 +78,7 @@ pub fn save(path: &Path, src: &(impl CacheSource + ?Sized)) -> Result<()> {
             w.write_all(&m.next_usn.to_le_bytes())?;
 
             let (mut count, mut names_len, mut too_large) = (0u64, 0u64, false);
-            src.for_each(v, &mut |rec, parent, name, _| {
+            src.for_each(v, &mut |rec, parent, name, _, _| {
                 count += 1;
                 names_len += name.len() as u64;
                 too_large |= rec > u32::MAX as u64 || parent > u32::MAX as u64;
@@ -89,18 +90,20 @@ pub fn save(path: &Path, src: &(impl CacheSource + ?Sized)) -> Result<()> {
             w.write_all(&names_len.to_le_bytes())?;
 
             let mut err = Ok(());
-            src.for_each(v, &mut |_, _, name, _| {
+            src.for_each(v, &mut |_, _, name, _, _| {
                 if err.is_ok() {
                     err = w.write_all(name.as_bytes());
                 }
             });
-            src.for_each(v, &mut |rec, parent, name, is_dir| {
+            src.for_each(v, &mut |rec, parent, name, is_dir, stat| {
                 if err.is_ok() {
-                    let mut buf = [0u8; 11];
+                    let mut buf = [0u8; RECORD_BYTES];
                     buf[0..4].copy_from_slice(&(rec as u32).to_le_bytes());
                     buf[4..8].copy_from_slice(&(parent as u32).to_le_bytes());
                     buf[8..10].copy_from_slice(&(name.len() as u16).to_le_bytes());
                     buf[10] = is_dir as u8;
+                    buf[11..19].copy_from_slice(&stat.size.to_le_bytes());
+                    buf[19..23].copy_from_slice(&stat.mtime.to_le_bytes());
                     err = w.write_all(&buf);
                 }
             });
@@ -160,7 +163,7 @@ fn parse(data: &[u8]) -> Result<Vec<VolumeScan>> {
         let n = r.u64()? as usize;
         let names_len = r.u64()? as usize;
         let names = std::str::from_utf8(r.take(names_len)?).context("cache names not UTF-8")?;
-        ensure!(n.checked_mul(11).is_some_and(|b| b <= data.len()), "cache record count");
+        ensure!(n.checked_mul(RECORD_BYTES).is_some_and(|b| b <= data.len()), "cache record count");
         let mut scan = VolumeScan::with_capacity(letter, meta, n, names_len);
         let mut off = 0usize;
         for _ in 0..n {
@@ -168,9 +171,10 @@ fn parse(data: &[u8]) -> Result<Vec<VolumeScan>> {
             let parent = r.u32()? as u64;
             let len = r.u16()? as usize;
             let is_dir = r.u8()? != 0;
+            let stat = Stat { size: r.u64()?, mtime: r.u32()? };
             let name = names.get(off..off + len).context("cache name out of range")?;
             off += len;
-            scan.push_str(rec, parent, name, is_dir);
+            scan.push_str(rec, parent, name, is_dir, stat);
         }
         ensure!(off == names_len, "cache names length mismatch");
         out.push(scan);
@@ -187,16 +191,17 @@ mod tests {
     fn roundtrip() {
         let meta = VolumeMeta { serial: 7, root_frn: 5, journal_id: 9, next_usn: 1234 };
         let mut s = VolumeScan::new('D', meta);
-        s.push_str(10, 5, "文件夹", true);
-        s.push_str(11, 10, "a.txt", false);
+        s.push_str(10, 5, "文件夹", true, Stat::UNKNOWN);
+        s.push_str(11, 10, "a.txt", false, Stat { size: 42, mtime: 1_700_000_000 });
         let path = std::env::temp_dir().join("swiftfind-test").join("idx.bin");
         save(&path, &[s][..]).unwrap();
         let back = load(&path).unwrap();
         assert_eq!(back.len(), 1);
         let b = &back[0];
         assert_eq!((b.letter, b.meta), ('D', meta));
-        let names: Vec<_> = b.recs.iter().map(|r| (r.rec, r.parent, b.name(r), r.is_dir)).collect();
-        assert_eq!(names, [(10, 5, "文件夹", true), (11, 10, "a.txt", false)]);
+        let names: Vec<_> = b.recs.iter().map(|r| (r.rec, r.parent, b.name(r), r.is_dir, r.stat.size)).collect();
+        assert_eq!(names, [(10, 5, "文件夹", true, u64::MAX), (11, 10, "a.txt", false, 42)]);
+        assert_eq!(b.recs[1].stat.mtime, 1_700_000_000);
         assert!(parse(&std::fs::read(&path).unwrap()[..20]).is_err());
         let _ = std::fs::remove_file(&path);
     }
@@ -206,9 +211,9 @@ mod tests {
         use crate::index::{Index, RawRecord};
         let meta = VolumeMeta { serial: 1, root_frn: 5, journal_id: 2, next_usn: 3 };
         let mut s = VolumeScan::new('C', meta);
-        s.push_str(10, 5, "Windows", true);
-        s.push_str(11, 10, "notepad.exe", false);
-        s.push_str(12, 5, "用户", true);
+        s.push_str(10, 5, "Windows", true, Stat::UNKNOWN);
+        s.push_str(11, 10, "notepad.exe", false, Stat { size: 1, mtime: 2 });
+        s.push_str(12, 5, "用户", true, Stat::UNKNOWN);
         let mut idx = Index::default();
         idx.add_volume(s);
         idx.upsert('C', &RawRecord { frn: 13, parent_frn: 12, name: "新建.txt".into(), is_dir: false });
@@ -220,7 +225,7 @@ mod tests {
         let expected = idx.snapshot();
         let flat = |v: &[VolumeScan]| -> Vec<_> {
             v.iter()
-                .flat_map(|s| s.recs.iter().map(move |r| (s.letter, s.meta, r.rec, r.parent, s.name(r).to_string(), r.is_dir)))
+                .flat_map(|s| s.recs.iter().map(move |r| (s.letter, s.meta, r.rec, r.parent, s.name(r).to_string(), r.is_dir, r.stat)))
                 .collect()
         };
         assert_eq!(flat(&loaded), flat(&expected));

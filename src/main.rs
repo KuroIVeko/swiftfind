@@ -8,11 +8,30 @@ mod ntfs;
 mod os;
 mod persist;
 mod text_input;
+mod tray;
 
-use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use futures::StreamExt;
+use gpui::{App, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
 use std::sync::Arc;
+use tray::TrayEvent;
+
+/// Win32 handle of a gpui window (0 if unavailable).
+fn hwnd_of(window: &Window) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        _ => 0,
+    }
+}
 
 fn main() {
+    let diagnostic = std::env::args().any(|a| a == "--no-ui" || a == "--compare-scan");
+    // Already running (possibly hidden in the tray): bring it up instead.
+    // Done before elevating, so this needs no UAC prompt.
+    if !diagnostic && tray::activate_existing() {
+        return;
+    }
+
     // Reading the MFT / USN journal requires administrator rights.
     if !os::is_elevated() {
         if !os::relaunch_elevated() {
@@ -44,6 +63,12 @@ fn main() {
             for line in shared.index.read().bench_search(&queries, 7) {
                 indexer::log(line);
             }
+            for line in shared.index.read().bench_sort() {
+                indexer::log(line);
+            }
+            for line in shared.index.read().verify_stats(3000) {
+                indexer::log(line);
+            }
         }
         for i in 1..=6 {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -55,26 +80,59 @@ fn main() {
 
     indexer::start(shared.clone(), None);
 
+    let (events_tx, mut events) = futures::channel::mpsc::unbounded();
+    let tray = tray::start(events_tx);
+    let notice = (!tray.hotkey_ok).then(|| format!("热键 {} 已被其他程序占用", tray::HOTKEY_LABEL));
+    if let Some(n) = &notice {
+        indexer::log(n.clone());
+    }
+
     gpui_platform::application().run(move |cx: &mut App| {
         app::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("SwiftFind".into()),
+        let mut hwnd = 0;
+        let main = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("SwiftFind".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| app::SwiftFindApp::new(shared.clone(), window, cx)),
-        )
-        .expect("open window");
-        let on_close = shared.clone();
-        cx.on_window_closed(move |cx, _| {
-            if cx.windows().is_empty() {
-                on_close.save_if_dirty();
-                cx.quit();
+                },
+                |window, cx| {
+                    hwnd = hwnd_of(window);
+                    os::window::set_icon(hwnd, tray::icon());
+                    // Closing only hides to the tray; quit from the tray menu.
+                    window.on_window_should_close(cx, move |_, _| {
+                        os::window::hide(hwnd);
+                        false
+                    });
+                    cx.new(|cx| app::SwiftFindApp::new(shared.clone(), notice, window, cx))
+                },
+            )
+            .expect("open window");
+
+        cx.spawn(async move |cx| {
+            while let Some(event) = events.next().await {
+                let show = match event {
+                    TrayEvent::Toggle if os::window::is_front(hwnd) => {
+                        os::window::hide(hwnd);
+                        false
+                    }
+                    TrayEvent::Toggle | TrayEvent::Show => true,
+                    TrayEvent::Quit => {
+                        shared.save_if_dirty();
+                        tray.remove();
+                        cx.update(|cx| cx.quit());
+                        break;
+                    }
+                };
+                if show {
+                    os::window::show(hwnd);
+                    main.update(cx, |app, window, cx| app.focus_search(window, cx)).ok();
+                }
             }
         })
         .detach();

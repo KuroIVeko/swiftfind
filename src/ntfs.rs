@@ -1,7 +1,7 @@
 //! NTFS volume access: full enumeration via `FSCTL_ENUM_USN_DATA` and live
 //! change tracking via `FSCTL_READ_USN_JOURNAL`. Requires administrator rights.
 
-use crate::index::{RawRecord, VolumeMeta, VolumeScan};
+use crate::index::{RawRecord, Stat, VolumeMeta, VolumeScan};
 use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -18,7 +18,9 @@ use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
     CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_QUERY_USN_JOURNAL,
     FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0, NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
-    USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+    USN_REASON_RENAME_NEW_NAME,
 };
 use windows::core::HSTRING;
 
@@ -201,7 +203,7 @@ impl NtfsVolume {
             }
             med.StartFileReferenceNumber = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             parse_records(&buf[8..n], |r| {
-                scan.push_utf16(r.frn, r.parent_frn, r.name_utf16(), r.is_dir);
+                scan.push_utf16(r.frn, r.parent_frn, r.name_utf16(), r.is_dir, Stat::UNKNOWN);
             });
         }
         Ok(scan)
@@ -213,7 +215,13 @@ impl NtfsVolume {
         loop {
             let rd = READ_USN_JOURNAL_DATA_V0 {
                 StartUsn: self.next_usn,
-                ReasonMask: USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME,
+                ReasonMask: USN_REASON_FILE_CREATE
+                    | USN_REASON_FILE_DELETE
+                    | USN_REASON_RENAME_NEW_NAME
+                    | USN_REASON_DATA_OVERWRITE
+                    | USN_REASON_DATA_EXTEND
+                    | USN_REASON_DATA_TRUNCATION
+                    | USN_REASON_BASIC_INFO_CHANGE,
                 ReturnOnlyOnClose: 0,
                 Timeout: 0,
                 BytesToWaitFor: 0,
@@ -236,8 +244,12 @@ impl NtfsVolume {
             let next = i64::from_le_bytes(buf[0..8].try_into().unwrap());
             let had_records = n > 8;
             parse_records(&buf[8..n], |r| {
+                // Reasons accumulate until the file is closed, so a record
+                // for a renamed file also carries its later data changes.
                 f(if r.reason & USN_REASON_FILE_DELETE != 0 {
                     Change::Removed(r.frn)
+                } else if r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) == 0 {
+                    Change::Modified(r.frn)
                 } else {
                     Change::Upsert(RawRecord {
                         frn: r.frn,
@@ -256,8 +268,11 @@ impl NtfsVolume {
 }
 
 pub enum Change {
+    /// Created, renamed or moved.
     Upsert(RawRecord),
     Removed(u64),
+    /// Contents or timestamps changed; only size/mtime need refreshing.
+    Modified(u64),
 }
 
 /// A USN record borrowed from the ioctl output buffer.

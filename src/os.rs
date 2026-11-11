@@ -89,3 +89,72 @@ pub fn memory_mb() -> (u64, u64, u64) {
     let mb = |b: usize| (b / (1024 * 1024)) as u64;
     (mb(c.PrivateUsage), mb(c.WorkingSetSize), mb(c.PeakWorkingSetSize))
 }
+
+/// Shows the shell "Properties" dialog for a file or folder.
+pub fn properties(path: &str) {
+    use windows::Win32::UI::Shell::{SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW};
+    let file = HSTRING::from(path);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST,
+        lpVerb: w!("properties"),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = ShellExecuteExW(&mut info);
+    }
+}
+
+pub mod window {
+    //! Direct Win32 control of the main window (gpui has no hide/show on Windows).
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    fn h(hwnd: isize) -> HWND {
+        HWND(hwnd as _)
+    }
+
+    pub fn hide(hwnd: isize) {
+        unsafe {
+            let _ = ShowWindow(h(hwnd), SW_HIDE);
+        }
+    }
+
+    /// Whether the window is visible and the active foreground window.
+    pub fn is_front(hwnd: isize) -> bool {
+        unsafe { IsWindowVisible(h(hwnd)).as_bool() && !IsIconic(h(hwnd)).as_bool() && GetForegroundWindow() == h(hwnd) }
+    }
+
+    /// Shows, restores and activates the window.
+    pub fn show(hwnd: isize) {
+        let hwnd = h(hwnd);
+        unsafe {
+            let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
+            if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+                return;
+            }
+            // Foreground lock: borrow the input state of the current
+            // foreground thread so the activation is allowed.
+            let fg = GetForegroundWindow();
+            let fg_thread = GetWindowThreadProcessId(fg, None);
+            let me = GetCurrentThreadId();
+            if fg_thread != 0 && fg_thread != me {
+                let _ = AttachThreadInput(me, fg_thread, true);
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = AttachThreadInput(me, fg_thread, false);
+            }
+        }
+    }
+
+    pub fn set_icon(hwnd: isize, icon: HICON) {
+        unsafe {
+            for kind in [ICON_BIG, ICON_SMALL] {
+                SendMessageW(h(hwnd), WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
+            }
+        }
+    }
+}

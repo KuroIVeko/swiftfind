@@ -6,7 +6,7 @@
 //! scan. The cache is rewritten after full scans, periodically while changes
 //! arrive, and on exit.
 
-use crate::index::{Index, VolumeScan};
+use crate::index::{Index, Stat, VolumeScan};
 use crate::ntfs::{Change, JournalError, NtfsVolume, ntfs_drives};
 use crate::persist;
 use parking_lot::{Mutex, RwLock};
@@ -224,20 +224,47 @@ fn sync_volume(shared: &Shared, vol: &mut NtfsVolume) {
             return;
         }
     }
-    let mut index = shared.index.write();
-    for c in &changes {
-        match c {
-            Change::Upsert(r) => index.upsert(vol.letter, r),
-            Change::Removed(frn) => index.remove(vol.letter, *frn),
+    // Entries whose size/mtime must be re-read: changed files, plus the
+    // directories they were created in / removed from.
+    let mut touched = Vec::new();
+    {
+        let mut index = shared.index.write();
+        for c in &changes {
+            match c {
+                Change::Upsert(r) => {
+                    // Could be a create or a move: refresh the parent too.
+                    if let Some(idx) = index.upsert(vol.letter, r) {
+                        touched.extend([idx, index.parent(idx)]);
+                    }
+                }
+                Change::Removed(frn) => touched.extend(index.remove(vol.letter, *frn)),
+                Change::Modified(frn) => touched.extend(index.entry_of(vol.letter, *frn)),
+            }
         }
+        // Keep the recorded journal position in step with the applied changes, so
+        // a snapshot is always consistent with the USN it claims.
+        index.set_next_usn(vol.letter, vol.next_usn);
     }
-    // Keep the recorded journal position in step with the applied changes, so
-    // a snapshot is always consistent with the USN it claims.
-    index.set_next_usn(vol.letter, vol.next_usn);
-    if !changes.is_empty() {
-        shared.dirty.store(true, Ordering::SeqCst);
+    if changes.is_empty() {
+        return;
+    }
+    shared.dirty.store(true, Ordering::SeqCst);
+
+    // Stat outside the lock. Only this thread mutates the index, so the
+    // entry indices stay valid in between.
+    touched.sort_unstable();
+    touched.dedup();
+    let paths: Vec<(u32, String)> = {
+        let index = shared.index.read();
+        touched.iter().filter(|&&i| index.is_alive(i)).map(|&i| (i, index.full_path(i))).collect()
+    };
+    let stats: Vec<(u32, Stat)> = paths.iter().filter_map(|(i, p)| Some((*i, Stat::from_fs(p)?))).collect();
+    let mut index = shared.index.write();
+    for (i, st) in stats {
+        index.set_stat(i, st);
     }
 }
+
 
 /// Diagnostic: scans every volume both ways and reports differences.
 pub fn compare_scans() {

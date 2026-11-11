@@ -10,9 +10,11 @@ gpui = { path = "third_party/zed/crates/gpui" }
 gpui_platform = { path = "third_party/zed/crates/gpui_platform" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
 memchr = "2"
 parking_lot = "0.12"
 rayon = "1"
+raw-window-handle = "0.6"
 unicode-segmentation = "1.10"
 
 [dependencies.windows]
@@ -27,6 +29,10 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
 ]
 
 # Same patches Zed's own workspace applies; gpui relies on them.
