@@ -4,6 +4,7 @@ mod app;
 mod hotkey;
 mod index;
 mod indexer;
+mod launch;
 mod mft;
 mod ntfs;
 mod os;
@@ -26,7 +27,7 @@ fn hwnd_of(window: &Window) -> isize {
 }
 
 fn main() {
-    let diagnostic = std::env::args().any(|a| a == "--no-ui" || a == "--compare-scan");
+    let diagnostic = std::env::args().any(|a| a == "--no-ui" || a == "--compare-scan" || a == "--test-launch");
     // Already running (possibly hidden in the tray): bring it up instead.
     // Done before elevating, so this needs no UAC prompt.
     if !diagnostic && tray::activate_existing() {
@@ -42,6 +43,11 @@ fn main() {
     }
 
     let shared = Arc::new(indexer::Shared::default());
+
+    if std::env::args().any(|a| a == "--test-launch") {
+        launch::self_test();
+        return;
+    }
 
     if std::env::args().any(|a| a == "--compare-scan") {
         indexer::compare_scans();

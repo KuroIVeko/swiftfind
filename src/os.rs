@@ -1,6 +1,5 @@
 //! Small Windows helpers: elevation, opening files, revealing in Explorer.
 
-use std::os::windows::process::CommandExt;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -61,18 +60,25 @@ pub fn error_box(msg: &str) {
     }
 }
 
-/// Opens a file or folder with its default handler.
+/// Opens a file or folder with its default handler, as the normal user.
 pub fn open(path: &str) {
-    unsafe {
-        ShellExecuteW(None, w!("open"), &HSTRING::from(path), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    let dir = std::path::Path::new(path).parent().map(|p| p.display().to_string()).unwrap_or_default();
+    crate::launch::spawn(path.to_string(), String::new(), dir);
 }
 
-/// Opens Explorer with the item selected.
+/// Opens Explorer with the item selected, as the normal user.
 pub fn reveal(path: &str) {
-    let _ = std::process::Command::new("explorer.exe")
-        .raw_arg(format!("/select,\"{path}\""))
-        .spawn();
+    crate::launch::spawn("explorer.exe".into(), format!("/select,\"{path}\""), String::new());
+}
+
+/// Direct `ShellExecute` from this (elevated) process; fallback only.
+pub fn shell_execute_elevated(file: &str, args: &str, dir: &str) {
+    let opt = |s: &str| (!s.is_empty()).then(|| HSTRING::from(s));
+    let (args, dir) = (opt(args), opt(dir));
+    let ptr = |h: &Option<HSTRING>| h.as_ref().map_or(PCWSTR::null(), |h| PCWSTR(h.as_ptr()));
+    unsafe {
+        ShellExecuteW(None, PCWSTR::null(), &HSTRING::from(file), ptr(&args), ptr(&dir), SW_SHOWNORMAL);
+    }
 }
 
 /// (private bytes, working set, peak working set) of this process, in MB.
