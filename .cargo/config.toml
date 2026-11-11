@@ -1,2 +1,7 @@
 [net]
 git-fetch-with-cli = true
+
+# Link the C runtime statically, so the exe runs without the
+# Visual C++ Redistributable (VCRUNTIME140.dll) installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

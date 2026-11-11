@@ -3,6 +3,9 @@ name = "swiftfind"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [dependencies]
 # gpui comes from a source snapshot of Zed at a pinned commit
 # (f8cfc7ed9e57503def9479138894f3139f5400cc), extracted to third_party/zed.

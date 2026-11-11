@@ -134,7 +134,7 @@ fn main() {
                 |window, cx| {
                     theme::follow_system(window, cx);
                     hwnd = hwnd_of(window);
-                    os::window::set_icon(hwnd, tray::icon());
+                    os::window::set_icon(hwnd, tray::icon_large(), tray::icon());
                     // Closing only hides to the tray; quit from the tray menu.
                     let on_close = shared.clone();
                     window.on_window_should_close(cx, move |_, _| {

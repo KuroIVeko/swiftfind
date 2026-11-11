@@ -9,7 +9,6 @@ use futures::channel::mpsc::UnboundedSender;
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::Shell::{
@@ -45,6 +44,7 @@ const HOTKEY_ID: i32 = 1;
 static EVENTS: OnceLock<UnboundedSender<TrayEvent>> = OnceLock::new();
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 static ICON: OnceLock<isize> = OnceLock::new();
+static ICON_LARGE: OnceLock<isize> = OnceLock::new();
 /// Tooltip of the tray icon (mentions the current hotkey).
 static TIP: Mutex<String> = Mutex::new(String::new());
 
@@ -90,9 +90,25 @@ pub fn activate_existing() -> bool {
     }
 }
 
-/// The app icon (a magnifying glass), drawn at runtime.
+/// The app icon at small-icon size (tray, title bar).
 pub fn icon() -> HICON {
-    HICON(*ICON.get_or_init(|| make_icon().0 as isize) as _)
+    HICON(*ICON.get_or_init(|| load_icon(SM_CXSMICON, SM_CYSMICON)) as _)
+}
+
+/// The app icon at large-icon size (Alt+Tab, taskbar).
+pub fn icon_large() -> HICON {
+    HICON(*ICON_LARGE.get_or_init(|| load_icon(SM_CXICON, SM_CYICON)) as _)
+}
+
+/// Loads icon resource 1 (embedded by build.rs) at the given system size.
+fn load_icon(cx: SYSTEM_METRICS_INDEX, cy: SYSTEM_METRICS_INDEX) -> isize {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        LoadImageW(Some(instance.into()), PCWSTR(1 as _), IMAGE_ICON, GetSystemMetrics(cx), GetSystemMetrics(cy), LR_DEFAULTCOLOR)
+            .map(|h| h.0 as isize)
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION).map(|h| h.0 as isize))
+            .unwrap_or(0)
+    }
 }
 
 pub fn start(events: UnboundedSender<TrayEvent>, hotkey: Hotkey) -> Tray {
@@ -219,47 +235,5 @@ fn show_menu(hwnd: HWND) {
             MENU_QUIT => send(TrayEvent::Quit),
             _ => {}
         }
-    }
-}
-
-/// Draws a 32×32 magnifying glass with anti-aliased edges.
-fn make_icon() -> HICON {
-    const N: usize = 32;
-    let mut px = vec![0u32; N * N];
-    let (cx, cy, r) = (13.0f32, 13.0f32, 8.5f32);
-    for y in 0..N {
-        for x in 0..N {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-            // Ring of the lens.
-            let ring = (2.0 - (d - r).abs()).clamp(0.0, 1.0);
-            // Lens glass, lightly tinted.
-            let glass = (r - 1.0 - d).clamp(0.0, 1.0);
-            // Handle: distance to the segment from the ring to the corner.
-            let (ax, ay, bx, by) = (19.5f32, 19.5f32, 28.0f32, 28.0f32);
-            let t = (((fx - ax) * (bx - ax) + (fy - ay) * (by - ay)) / ((bx - ax).powi(2) + (by - ay).powi(2))).clamp(0.0, 1.0);
-            let dh = ((fx - (ax + t * (bx - ax))).powi(2) + (fy - (ay + t * (by - ay))).powi(2)).sqrt();
-            let handle = (3.0 - dh).clamp(0.0, 1.0);
-            let solid = ring.max(handle);
-            let (a, rgb) = if solid > 0.0 {
-                (solid, 0x1f6fd6u32)
-            } else {
-                (glass * 0.35, 0x8cc4ff)
-            };
-            let a = (a * 255.0) as u32;
-            // Premultiplied BGRA.
-            let ch = |shift: u32| ((rgb >> shift) & 0xFF) * a / 255;
-            px[y * N + x] = (a << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
-        }
-    }
-    unsafe {
-        let color = CreateBitmap(N as i32, N as i32, 1, 32, Some(px.as_ptr() as *const _));
-        let mask_bits = vec![0u8; N * N / 8];
-        let mask = CreateBitmap(N as i32, N as i32, 1, 1, Some(mask_bits.as_ptr() as *const _));
-        let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-        let icon = CreateIconIndirect(&info).unwrap_or_default();
-        let _ = DeleteObject(color.into());
-        let _ = DeleteObject(mask.into());
-        icon
     }
 }

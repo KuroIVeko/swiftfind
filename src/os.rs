@@ -160,9 +160,9 @@ pub mod window {
         }
     }
 
-    pub fn set_icon(hwnd: isize, icon: HICON) {
+    pub fn set_icon(hwnd: isize, big: HICON, small: HICON) {
         unsafe {
-            for kind in [ICON_BIG, ICON_SMALL] {
+            for (kind, icon) in [(ICON_BIG, big), (ICON_SMALL, small)] {
                 SendMessageW(h(hwnd), WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
             }
         }
