@@ -10,7 +10,7 @@ use crate::text_input::{self, Changed, TextInput};
 use crate::theme::{self, Theme};
 use gpui::{
     App, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString,
     UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*, px,
     uniform_list,
 };
@@ -50,8 +50,69 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 const ROW_H: f32 = 24.;
-const COL_SIZE: f32 = 100.;
-const COL_DATE: f32 = 150.;
+
+/// Resizable columns; the path column takes the remaining width.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Col {
+    Name,
+    Size,
+    Date,
+}
+
+#[derive(Clone, Copy)]
+struct Columns {
+    name: f32,
+    size: f32,
+    date: f32,
+}
+
+impl Columns {
+    const DEFAULT: Columns = Columns { name: 320., size: 100., date: 150. };
+    const MIN: f32 = 50.;
+    /// Width always left for the path column while dragging.
+    const MIN_PATH: f32 = 80.;
+
+    /// From `columns=name,size,date` in settings.ini.
+    fn load() -> Columns {
+        let parsed = crate::settings::get("columns").and_then(|v| {
+            let w: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            let ok = w.len() == 3 && w.iter().all(|x| x.is_finite() && (Self::MIN..=4000.).contains(x));
+            ok.then(|| Columns { name: w[0], size: w[1], date: w[2] })
+        });
+        parsed.unwrap_or(Self::DEFAULT)
+    }
+
+    fn save(&self) {
+        let v = format!("{:.0},{:.0},{:.0}", self.name, self.size, self.date);
+        if let Err(e) = crate::settings::set("columns", &v) {
+            crate::indexer::log(format!("save column widths: {e}"));
+        }
+    }
+
+    fn get(&self, c: Col) -> f32 {
+        match c {
+            Col::Name => self.name,
+            Col::Size => self.size,
+            Col::Date => self.date,
+        }
+    }
+
+    fn set(&mut self, c: Col, w: f32) {
+        match c {
+            Col::Name => self.name = w,
+            Col::Size => self.size = w,
+            Col::Date => self.date = w,
+        }
+    }
+}
+
+/// A column border being dragged.
+#[derive(Clone, Copy)]
+struct ColDrag {
+    col: Col,
+    start_x: Pixels,
+    start_w: f32,
+}
 
 #[derive(Clone, Default)]
 struct Row {
@@ -131,6 +192,12 @@ pub struct SwiftFindApp {
     rows_gen: u64,
     sort: SortKey,
     sort_desc: bool,
+    /// The current query has size/date filters (results change with stats).
+    query_uses_stats: bool,
+    /// Unrecognized filters in the current query.
+    query_error: Option<String>,
+    cols: Columns,
+    col_drag: Option<ColDrag>,
     menu: Option<Menu>,
     settings: Option<Settings>,
     tray: Tray,
@@ -150,7 +217,7 @@ impl SwiftFindApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| TextInput::new("搜索文件名…（空格分隔多个关键词，支持 * ? 通配符）", cx));
+        let input = cx.new(|cx| TextInput::new("搜索文件名…（空格分隔多个关键词；支持 * ?、ext:、size:、dm:、file:、folder:）", cx));
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
             this.selected = None;
             this.search(cx);
@@ -189,6 +256,10 @@ impl SwiftFindApp {
             rows_gen: u64::MAX,
             sort: SortKey::Name,
             sort_desc: false,
+            query_uses_stats: false,
+            query_error: None,
+            cols: Columns::load(),
+            col_drag: None,
             menu: None,
             settings: None,
             tray,
@@ -215,7 +286,7 @@ impl SwiftFindApp {
         else {
             return; // indexer is writing; try next tick
         };
-        let stat_sorted = matches!(self.sort, SortKey::Size | SortKey::Modified);
+        let stat_sorted = matches!(self.sort, SortKey::Size | SortKey::Modified) || self.query_uses_stats;
         let stale = epoch != self.result_epoch
             || tree_gen != self.result_tree_gen
             || (stat_sorted && generation != self.result_gen);
@@ -244,6 +315,7 @@ impl SwiftFindApp {
             let generation = index.generation.load(Ordering::Relaxed);
             let stamp = (generation, index.tree_generation, index.epoch);
             let q = Query::parse(&query);
+            let info = (q.uses_stats(), (!q.errors.is_empty()).then(|| q.errors.join("；")));
             let res = if q.is_empty() && sort == SortKey::Name {
                 Results::All { len: index.live_count(), rev: desc }
             } else {
@@ -251,7 +323,7 @@ impl SwiftFindApp {
                 index.sort_results(&mut res, sort, desc);
                 Results::List(res)
             };
-            Some((res, stamp, t.elapsed()))
+            Some((res, stamp, t.elapsed(), info))
         });
         cx.spawn(async move |this, cx| {
             let res = task.await;
@@ -260,7 +332,9 @@ impl SwiftFindApp {
                     return;
                 }
                 this.searching = false;
-                if let Some((results, (generation, tree_gen, epoch), elapsed)) = res {
+                if let Some((results, (generation, tree_gen, epoch), elapsed, (uses_stats, error))) = res {
+                    this.query_uses_stats = uses_stats;
+                    this.query_error = error;
                     this.results = Arc::new(results);
                     this.positions.clear();
                     this.result_gen = generation;
@@ -616,11 +690,79 @@ impl SwiftFindApp {
             .px_2()
             .overflow_hidden()
             .whitespace_nowrap()
+            .relative()
             .border_r_1()
             .border_color(t.divider)
             .hover(move |s| s.bg(t.hover))
             .child(format!("{text}{arrow}"))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_sort(key, cx)))
+    }
+
+    /// Grip over a column border, `GRIP` wide and centered on it: the name
+    /// column's right edge, and the left edge of the columns right of the
+    /// (flexible) path column, so the border always follows the mouse.
+    /// Highlighted while hovered or dragged.
+    fn resize_handle(&self, col: Col, cx: &mut Context<Self>) -> impl IntoElement {
+        const GRIP: f32 = 10.;
+        let t = theme::get(cx);
+        let c = self.cols;
+        let active = self.col_drag.is_some_and(|d| d.col == col);
+        div()
+            .id(match col {
+                Col::Name => "grip-name",
+                Col::Size => "grip-size",
+                Col::Date => "grip-date",
+            })
+            .absolute()
+            .top_0()
+            .h_full()
+            .w(px(GRIP))
+            .map(|d| match col {
+                Col::Name => d.left(px(c.name - GRIP / 2.)),
+                Col::Size => d.right(px(c.date + c.size - GRIP / 2.)),
+                Col::Date => d.right(px(c.date - GRIP / 2.)),
+            })
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .group("grip")
+            .child(
+                div()
+                    .w(px(2.))
+                    .h_full()
+                    .when(active, |d| d.bg(t.accent))
+                    .group_hover("grip", move |s| s.bg(t.accent)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    // Keep the header cell from treating this as a sort click.
+                    cx.stop_propagation();
+                    this.col_drag = Some(ColDrag { col, start_x: ev.position.x, start_w: this.cols.get(col) });
+                    cx.notify();
+                }),
+            )
+    }
+
+    fn drag_column(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.col_drag else { return };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.end_col_drag(cx); // released outside the window
+            return;
+        }
+        let dx = (ev.position.x - d.start_x).as_f32();
+        let w = if d.col == Col::Name { d.start_w + dx } else { d.start_w - dx };
+        let others = self.cols.name + self.cols.size + self.cols.date - self.cols.get(d.col);
+        let max = (window.viewport_size().width.as_f32() - others - Columns::MIN_PATH).max(Columns::MIN);
+        self.cols.set(d.col, w.clamp(Columns::MIN, max));
+        cx.notify();
+    }
+
+    fn end_col_drag(&mut self, cx: &mut Context<Self>) {
+        if self.col_drag.take().is_some() {
+            self.cols.save();
+            cx.notify();
+        }
     }
 
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
@@ -674,6 +816,7 @@ impl Render for SwiftFindApp {
         let count = self.results.len();
         let selected = self.selected;
         let t = theme::get(cx);
+        let cols = self.cols;
 
         let list = uniform_list(
             "results",
@@ -715,10 +858,10 @@ impl Render for SwiftFindApp {
                                     cx.notify();
                                 }),
                             )
-                            .child(cell(row.name).flex_basis(px(0.)).flex_grow(3.).min_w_0())
-                            .child(cell(row.path).flex_basis(px(0.)).flex_grow(5.).min_w_0())
-                            .child(cell(row.size).w(px(COL_SIZE)).flex_none().text_right())
-                            .child(cell(row.modified).w(px(COL_DATE)).flex_none())
+                            .child(cell(row.name).w(px(cols.name)).flex_none())
+                            .child(cell(row.path).flex_grow(1.).flex_basis(px(0.)).min_w_0())
+                            .child(cell(row.size).w(px(cols.size)).flex_none().text_right())
+                            .child(cell(row.modified).w(px(cols.date)).flex_none())
                     })
                     .collect()
             }),
@@ -739,6 +882,10 @@ impl Render for SwiftFindApp {
             .on_action(cx.listener(Self::copy_path))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::open_settings_action))
+            .when(self.col_drag.is_some(), |d| d.cursor_col_resize())
+            .on_mouse_move(cx.listener(Self::drag_column))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_col_drag(cx)))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_col_drag(cx)))
             .flex()
             .flex_col()
             .size_full()
@@ -769,6 +916,7 @@ impl Render for SwiftFindApp {
             .child(
                 div()
                     .flex()
+                    .relative()
                     .flex_row()
                     .h(px(ROW_H))
                     .items_center()
@@ -776,10 +924,28 @@ impl Render for SwiftFindApp {
                     .border_b_1()
                     .border_color(t.chrome_border)
                     .text_color(t.muted)
-                    .child(self.header_cell("名称", SortKey::Name, cx).flex_basis(px(0.)).flex_grow(3.).min_w_0())
-                    .child(self.header_cell("路径", SortKey::Path, cx).flex_basis(px(0.)).flex_grow(5.).min_w_0())
-                    .child(self.header_cell("大小", SortKey::Size, cx).w(px(COL_SIZE)).flex_none().justify_end())
-                    .child(self.header_cell("修改时间", SortKey::Modified, cx).w(px(COL_DATE)).flex_none()),
+                    .child(
+                        self.header_cell("名称", SortKey::Name, cx)
+                            .w(px(cols.name))
+                            .flex_none(),
+                    )
+                    .child(self.header_cell("路径", SortKey::Path, cx).flex_grow(1.).flex_basis(px(0.)).min_w_0())
+                    .child(
+                        self.header_cell("大小", SortKey::Size, cx)
+                            .w(px(cols.size))
+                            .flex_none()
+                            .justify_end(),
+                    )
+                    .child(
+                        self.header_cell("修改时间", SortKey::Modified, cx)
+                            .w(px(cols.date))
+                            .flex_none(),
+                    )
+                    // Grips go last so they sit above the cells and can
+                    // straddle the borders.
+                    .child(self.resize_handle(Col::Name, cx))
+                    .child(self.resize_handle(Col::Size, cx))
+                    .child(self.resize_handle(Col::Date, cx)),
             )
             .child(list)
             .when_some(self.menu.clone(), |d, menu| d.child(self.render_menu(menu, cx)))
@@ -795,7 +961,17 @@ impl Render for SwiftFindApp {
                     .border_t_1()
                     .border_color(t.chrome_border)
                     .text_color(t.muted)
-                    .child(format!("{count} 个对象"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_3()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(format!("{count} 个对象"))
+                            .when_some(self.query_error.clone(), |d, e| d.child(div().text_color(t.error).child(e))),
+                    )
                     .child(format!(
                         "{}{status}  ·  搜索 {:.1} ms",
                         self.notice.as_ref().map(|n| format!("{n}  ·  ")).unwrap_or_default(),

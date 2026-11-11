@@ -10,12 +10,13 @@ mod mft;
 mod ntfs;
 mod os;
 mod persist;
+mod settings;
 mod text_input;
 mod theme;
 mod tray;
 
 use futures::StreamExt;
-use gpui::{App, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Bounds, DisplayId, Window, WindowBounds, WindowOptions, point, prelude::*, px, size};
 use std::sync::Arc;
 use tray::TrayEvent;
 
@@ -34,6 +35,42 @@ fn hide(hwnd: isize, shared: &Arc<indexer::Shared>) {
     os::window::hide(hwnd);
     let shared = shared.clone();
     std::thread::spawn(move || shared.save_if_older_than(indexer::HIDE_SAVE_INTERVAL));
+}
+
+/// Saves the window's placement (`window=` in settings.ini): state, restore
+/// bounds in gpui's logical pixels, and the display they belong to.
+fn remember_window(window: &Window, cx: &App) {
+    let (state, b) = match window.window_bounds() {
+        WindowBounds::Maximized(b) => ("max", b),
+        WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => ("normal", b),
+    };
+    let Some(uuid) = window.display(cx).and_then(|d| d.uuid().ok()) else { return };
+    let v = format!(
+        "{state},{:.0},{:.0},{:.0},{:.0},{uuid}",
+        b.origin.x.as_f32(),
+        b.origin.y.as_f32(),
+        b.size.width.as_f32(),
+        b.size.height.as_f32()
+    );
+    if let Err(e) = settings::set("window", &v) {
+        indexer::log(format!("save window placement: {e}"));
+    }
+}
+
+/// The saved placement, if its display is still connected.
+fn saved_window(cx: &App) -> Option<(WindowBounds, DisplayId)> {
+    let v = settings::get("window")?;
+    let parts: Vec<&str> = v.split(',').collect();
+    let [state, x, y, w, h, uuid] = parts[..] else { return None };
+    let n = |s: &str| s.trim().parse::<f32>().ok().filter(|v| v.is_finite());
+    let (w, h) = (n(w)?, n(h)?);
+    if w < 400. || h < 300. {
+        return None;
+    }
+    let bounds = Bounds { origin: point(px(n(x)?), px(n(y)?)), size: size(px(w), px(h)) };
+    let display = cx.displays().into_iter().find(|d| d.uuid().is_ok_and(|u| u.to_string() == uuid))?;
+    let bounds = if state == "max" { WindowBounds::Maximized(bounds) } else { WindowBounds::Windowed(bounds) };
+    Some((bounds, display.id()))
 }
 
 fn main() {
@@ -116,12 +153,16 @@ fn main() {
 
     gpui_platform::application().run(move |cx: &mut App| {
         app::bind_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
+        let (bounds, display_id) = match saved_window(cx) {
+            Some((b, d)) => (b, Some(d)),
+            None => (WindowBounds::Windowed(Bounds::centered(None, size(px(1100.), px(700.)), cx)), None),
+        };
         let mut hwnd = 0;
         let main = cx
             .open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(bounds),
+                    display_id,
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some("SwiftFind".into()),
                         ..Default::default()
@@ -137,7 +178,8 @@ fn main() {
                     os::window::set_icon(hwnd, tray::icon_large(), tray::icon());
                     // Closing only hides to the tray; quit from the tray menu.
                     let on_close = shared.clone();
-                    window.on_window_should_close(cx, move |_, _| {
+                    window.on_window_should_close(cx, move |window, cx| {
+                        remember_window(window, cx);
                         hide(hwnd, &on_close);
                         false
                     });
@@ -160,6 +202,7 @@ fn main() {
                         continue;
                     }
                     TrayEvent::Toggle if os::window::is_front(hwnd) => {
+                        main.update(cx, |_, window, cx| remember_window(window, cx)).ok();
                         hide(hwnd, &shared);
                         false
                     }
@@ -170,6 +213,10 @@ fn main() {
                         continue;
                     }
                     TrayEvent::Quit => {
+                        // Not while hidden: the placement was saved on hiding.
+                        if os::window::is_visible(hwnd) {
+                            main.update(cx, |_, window, cx| remember_window(window, cx)).ok();
+                        }
                         shared.save_if_dirty();
                         tray.remove();
                         cx.update(|cx| cx.quit());

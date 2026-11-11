@@ -1,6 +1,5 @@
 //! Global hotkey definition and the settings file that stores it.
 
-use std::path::PathBuf;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MapVirtualKeyW, VkKeyScanW,
 };
@@ -152,27 +151,13 @@ fn key_label(vk: u32) -> String {
     }
 }
 
-fn settings_path() -> PathBuf {
-    crate::persist::cache_path().with_file_name("settings.ini")
-}
-
 /// Configured hotkey, or the default if unset / unreadable.
 pub fn load() -> Hotkey {
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .filter_map(|l| l.split_once('='))
-                .find(|(k, _)| k.trim() == "hotkey")
-                .and_then(|(_, v)| Hotkey::parse(v))
-        })
-        .unwrap_or(Hotkey::DEFAULT)
+    crate::settings::get("hotkey").and_then(|v| Hotkey::parse(&v)).unwrap_or(Hotkey::DEFAULT)
 }
 
 pub fn save(h: &Hotkey) -> std::io::Result<()> {
-    let path = settings_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(path, format!("hotkey={}\n", h.label()))
+    crate::settings::set("hotkey", &h.label())
 }
 
 #[cfg(test)]

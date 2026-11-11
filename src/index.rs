@@ -7,6 +7,9 @@
 //! name, so search results come out already sorted without a per-query sort.
 
 pub mod cache;
+mod filter;
+
+use filter::Filter;
 
 use memchr::memmem;
 use rayon::prelude::*;
@@ -945,7 +948,7 @@ impl Index {
     /// is filtered by those bits to get name-sorted results. Walking `order`
     /// directly would cost two cache misses per entry.
     pub fn search(&self, query: &Query, is_cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Vec<u32>> {
-        if query.terms.is_empty() {
+        if query.is_empty() {
             return Some(self.order.clone());
         }
         const WORDS_PER_TASK: usize = 512; // 32K entries
@@ -990,7 +993,7 @@ impl Index {
     /// Previous single-pass implementation over `order`; kept as a reference
     /// for tests and the benchmark.
     pub fn search_by_order(&self, query: &Query, is_cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Vec<u32>> {
-        if query.terms.is_empty() {
+        if query.is_empty() {
             return Some(self.order.clone());
         }
         let chunks: Vec<Option<Vec<u32>>> = self
@@ -1014,6 +1017,9 @@ impl Index {
         thread_local! {
             static PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
         }
+        if !q.filters.is_empty() && !self.passes_filters(idx, &q.filters) {
+            return false;
+        }
         let name = self.name(idx);
         // Terms are sorted name-first, so the path is only built for entries
         // whose name already matched.
@@ -1035,6 +1041,28 @@ impl Index {
             }
         }
         true
+    }
+}
+
+impl Index {
+    /// Filters only read the entry itself, so they run before any name test.
+    fn passes_filters(&self, idx: u32, filters: &[Filter]) -> bool {
+        let e = &self.entries[idx as usize];
+        let is_dir = e.flags() & FLAG_DIR != 0;
+        filters.iter().all(|f| match f {
+            Filter::Dir(want_dir) => is_dir == *want_dir,
+            Filter::Size(r) => !is_dir && e.size() != u64::MAX && r.contains(&e.size()),
+            Filter::Modified(r) => e.mtime != 0 && r.contains(&(e.mtime as u64)),
+            Filter::Ext(exts) => {
+                let name = self.name(idx);
+                match name.rsplit_once('.') {
+                    Some((stem, ext)) if !stem.is_empty() => {
+                        exts.iter().any(|x| x.eq_ignore_ascii_case(ext) || (!ext.is_ascii() && ext.to_lowercase() == *x))
+                    }
+                    _ => false,
+                }
+            }
+        })
     }
 }
 
@@ -1191,35 +1219,66 @@ struct Term {
 
 /// A parsed search query: whitespace separated terms, all of which must match.
 /// Terms with `*` / `?` are wildcards matched against the whole name (or path).
+/// See [`filter`] for `ext:`, `size:`, `dm:`, `file:` and `folder:`.
 pub struct Query {
     terms: Vec<Term>,
+    filters: Vec<Filter>,
+    /// Filters that couldn't be parsed (and are ignored), for the status bar.
+    pub errors: Vec<String>,
 }
 
 impl Query {
     /// True for an empty query (matches every entry).
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty()
+        self.terms.is_empty() && self.filters.is_empty()
+    }
+
+    /// Whether results depend on sizes / modification times, which change
+    /// without the tree changing.
+    pub fn uses_stats(&self) -> bool {
+        self.filters.iter().any(|f| matches!(f, Filter::Size(_) | Filter::Modified(_)))
     }
 
     pub fn parse(s: &str) -> Self {
+        Self::parse_at(s, chrono::Local::now().date_naive())
+    }
+
+    fn parse_at(s: &str, today: chrono::NaiveDate) -> Self {
         let lower = s.to_lowercase();
-        let terms = lower
-            .split_whitespace()
-            .map(|t| {
-                let t = t.replace('/', "\\");
-                let on_path = t.contains('\\');
-                let matcher = if t.contains('*') || t.contains('?') {
-                    Matcher::Glob(t.chars().collect(), t.is_ascii().then(|| t.as_bytes().to_vec()))
-                } else {
-                    Matcher::Substr(t.as_bytes().to_vec(), memmem::Finder::new(t.as_bytes()).into_owned())
-                };
-                Term { matcher, on_path }
-            })
-            .collect::<Vec<Term>>();
-        let mut terms = terms;
+        let mut q = Query { terms: Vec::new(), filters: Vec::new(), errors: Vec::new() };
+        for token in lower.split_whitespace() {
+            let text = match filter::parse(token, today) {
+                filter::Token::Text => Some(token.to_string()),
+                filter::Token::Filter(f, text) => {
+                    q.filters.push(f);
+                    text
+                }
+                filter::Token::Incomplete => None,
+                filter::Token::Error(e) => {
+                    q.errors.push(e);
+                    None
+                }
+            };
+            if let Some(t) = text {
+                q.terms.push(Term::new(&t));
+            }
+        }
         // Cheap name terms first; path terms need a path to be built.
-        terms.sort_by_key(|t| t.on_path);
-        Query { terms }
+        q.terms.sort_by_key(|t| t.on_path);
+        q
+    }
+}
+
+impl Term {
+    fn new(t: &str) -> Term {
+        let t = t.replace('/', "\\");
+        let on_path = t.contains('\\');
+        let matcher = if t.contains('*') || t.contains('?') {
+            Matcher::Glob(t.chars().collect(), t.is_ascii().then(|| t.as_bytes().to_vec()))
+        } else {
+            Matcher::Substr(t.as_bytes().to_vec(), memmem::Finder::new(t.as_bytes()).into_owned())
+        };
+        Term { matcher, on_path }
     }
 }
 
@@ -1323,6 +1382,46 @@ mod tests {
         idx.set_stat(x, st(1, 99));
         assert_eq!(sorted(&idx, SortKey::Size, false), ["x.txt", "y.txt", "z.txt"]);
         assert_eq!(idx.stat(x), st(1, 99));
+    }
+
+    #[test]
+    fn filters() {
+        let meta = VolumeMeta { root_frn: 5, ..Default::default() };
+        let mut s = VolumeScan::new('C', meta);
+        let st = |size, mtime| Stat { size, mtime };
+        let day = |y, m, d| filter_secs(y, m, d);
+        s.push_str(10, 5, "docs.old", true, st(u64::MAX, day(2024, 1, 10)));
+        s.push_str(20, 10, "a.TXT", false, st(500, day(2024, 1, 15)));
+        s.push_str(21, 10, "b.md", false, st(5 << 20, day(2024, 3, 1)));
+        s.push_str(22, 10, ".gitignore", false, st(10, day(2025, 6, 1)));
+        s.push_str(23, 10, "c.txt", false, Stat::UNKNOWN);
+        let mut idx = Index::default();
+        idx.add_volume(s);
+        let today = chrono::NaiveDate::from_ymd_opt(2025, 6, 1).unwrap();
+        let names = |q: &str| -> Vec<String> {
+            let q = Query::parse_at(q, today);
+            idx.search(&q, &|| false).unwrap().into_iter().map(|i| idx.name(i).to_string()).collect()
+        };
+        assert_eq!(names("ext:txt"), ["a.TXT", "c.txt"]);
+        assert_eq!(names("ext:md;txt size:>1k"), ["b.md"]);
+        assert_eq!(names("ext:gitignore"), Vec::<String>::new());
+        assert_eq!(names("size:<=500"), [".gitignore", "a.TXT"]);
+        assert_eq!(names("dm:2024-01"), ["a.TXT", "docs.old"]);
+        assert_eq!(names("dm:today"), [".gitignore"]);
+        assert_eq!(names("dm:<2024-02 file:"), ["a.TXT"]);
+        assert_eq!(names("folder:"), ["docs.old"]);
+        assert_eq!(names("file:txt"), ["a.TXT", "c.txt"]);
+        assert_eq!(names("size: d"), ["b.md", "docs.old"]);
+        let q = Query::parse_at("size:huge dm:soon", today);
+        assert_eq!(q.errors.len(), 1);
+        assert!(q.uses_stats());
+        assert!(!Query::parse_at("ext:txt", today).uses_stats());
+    }
+
+    fn filter_secs(y: i32, m: u32, d: u32) -> u32 {
+        use chrono::TimeZone;
+        let t = chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        chrono::Local.from_local_datetime(&t).unwrap().timestamp() as u32
     }
 
     #[test]
