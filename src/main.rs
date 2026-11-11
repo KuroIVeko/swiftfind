@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[macro_use]
+mod i18n;
 mod app;
 mod autostart;
 mod hotkey;
@@ -85,7 +87,10 @@ fn main() {
     // Reading the MFT / USN journal requires administrator rights.
     if !os::is_elevated() {
         if !os::relaunch_elevated() {
-            os::error_box("需要管理员权限才能读取 NTFS 主文件表 (MFT)。");
+            os::error_box(tr!(
+                "Administrator rights are needed to read the NTFS Master File Table (MFT).",
+                "需要管理员权限才能读取 NTFS 主文件表 (MFT)。"
+            ));
         }
         return;
     }
@@ -146,7 +151,7 @@ fn main() {
     let (events_tx, mut events) = futures::channel::mpsc::unbounded();
     let hotkey = hotkey::load();
     let tray = tray::start(events_tx, hotkey);
-    let notice = (!tray.hotkey_ok).then(|| format!("热键 {} 已被其他程序占用，可在设置中更换", hotkey.label()));
+    let notice = (!tray.hotkey_ok).then(|| trf!("Hotkey {} is taken by another program; change it in Settings", "热键 {} 已被其他程序占用，可在设置中更换", hotkey.label()));
     if let Some(n) = &notice {
         indexer::log(n.clone());
     }

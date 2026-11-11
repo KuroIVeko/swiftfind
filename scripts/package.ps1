@@ -13,9 +13,12 @@ $stage = Join-Path $root "dist\$name"
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item target\release\swiftfind.exe (Join-Path $stage 'SwiftFind.exe')
-# README in UTF-8 with BOM so Notepad shows the Chinese text correctly.
-$readme = Get-Content -Raw -Encoding UTF8 scripts\README.txt
-[IO.File]::WriteAllText((Join-Path $stage '使用说明.txt'), $readme.Replace('{VERSION}', $version), (New-Object Text.UTF8Encoding $true))
+# READMEs in UTF-8 with BOM so Notepad shows the text correctly.
+$docs = [ordered]@{ 'README.txt' = '使用说明.txt'; 'README.en.txt' = 'README.txt' }
+foreach ($src in $docs.Keys) {
+    $text = Get-Content -Raw -Encoding UTF8 (Join-Path 'scripts' $src)
+    [IO.File]::WriteAllText((Join-Path $stage $docs[$src]), $text.Replace('{VERSION}', $version), (New-Object Text.UTF8Encoding $true))
+}
 
 $zip = Join-Path $root "dist\$name.zip"
 Remove-Item -Force $zip -ErrorAction SilentlyContinue

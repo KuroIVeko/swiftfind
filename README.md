@@ -20,6 +20,7 @@ SwiftFind is a fast file-name search tool for Windows, in the spirit of [Everyth
 - **Optional start at logon**: runs through a Task Scheduler task, so there's no UAC prompt at every logon.
 - **Follows the system light/dark theme**.
 - **Remembers your layout**: window position and size, plus column widths you can drag to adjust.
+- **English and Chinese UI**: follows the Windows display language. Add `language=en` or `language=zh` to `%LOCALAPPDATA%\swiftfind\settings.ini` to force one.
 - **Portable**: a single statically linked exe with no runtime dependencies.
 
 ### Search syntax
@@ -103,6 +104,7 @@ SwiftFind 是一款 Windows 上的极速文件名搜索工具，灵感来自 [Ev
 - **开机自启（可选）**：通过计划任务启动，每次登录都不会弹出 UAC。
 - **自动跟随系统深色 / 浅色模式**。
 - **记住布局**：记住窗口位置和大小，列宽也可以拖动调整。
+- **中英文界面**：跟随 Windows 显示语言。可在 `%LOCALAPPDATA%\swiftfind\settings.ini` 中加一行 `language=zh` 或 `language=en` 强制指定。
 - **绿色便携**：单个静态链接的 exe，不依赖任何运行库。
 
 ### 搜索语法

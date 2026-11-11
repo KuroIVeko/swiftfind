@@ -60,7 +60,10 @@ impl Hotkey {
         if self.ctrl || self.alt || self.win || is_fkey {
             Ok(())
         } else {
-            Err("需要包含 Ctrl、Alt 或 Win（F1–F24 除外），否则会干扰正常打字")
+            Err(tr!(
+                "Include Ctrl, Alt or Win (except for F1–F24), or it would get in the way of typing",
+                "需要包含 Ctrl、Alt 或 Win（F1–F24 除外），否则会干扰正常打字"
+            ))
         }
     }
 

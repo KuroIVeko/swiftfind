@@ -217,7 +217,13 @@ impl SwiftFindApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| TextInput::new("搜索文件名…（空格分隔多个关键词；支持 * ?、ext:、size:、dm:、file:、folder:）", cx));
+        let input = cx.new(|cx| TextInput::new(
+            tr!(
+                "Search file names… (space-separated keywords; supports * ?, ext:, size:, dm:, file:, folder:)",
+                "搜索文件名…（空格分隔多个关键词；支持 * ?、ext:、size:、dm:、file:、folder:）"
+            ),
+            cx,
+        ));
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
             this.selected = None;
             this.search(cx);
@@ -389,9 +395,13 @@ impl SwiftFindApp {
                 let Some(st) = this.settings.as_mut() else { return };
                 st.autostart = Some(enabled);
                 match result {
-                    Some(Err(e)) => st.message = Some((format!("开机自启设置失败：{e}"), true)),
+                    Some(Err(e)) => st.message = Some((trf!("Couldn't change start at logon: {e}", "开机自启设置失败：{e}"), true)),
                     Some(Ok(())) => {
-                        let text = if enabled { "已开启开机自动启动（启动后隐藏在托盘）" } else { "已关闭开机自动启动" };
+                        let text = if enabled {
+                            tr!("Start at logon is on (starts hidden in the tray)", "已开启开机自动启动（启动后隐藏在托盘）")
+                        } else {
+                            tr!("Start at logon is off", "已关闭开机自动启动")
+                        };
                         st.message = Some((text.into(), false));
                     }
                     None => {}
@@ -418,7 +428,7 @@ impl SwiftFindApp {
     pub fn hotkey_pressed_while_recording(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(st) = self.settings.as_mut().filter(|s| s.recording) else { return false };
         st.recording = false;
-        st.message = Some((format!("仍为 {}", self.hotkey.label()), false));
+        st.message = Some((trf!("Still {}", "仍为 {}", self.hotkey.label()), false));
         cx.notify();
         true
     }
@@ -446,7 +456,7 @@ impl SwiftFindApp {
         let m = &k.modifiers;
         let candidate = Hotkey::from_keystroke(m.control, m.alt, m.shift, m.platform, &k.key);
         match candidate.map(|h| h.validate().map(|_| h)) {
-            None => st.message = Some(("不支持这个按键，请换一个".into(), true)),
+            None => st.message = Some((tr!("This key isn't supported; try another", "不支持这个按键，请换一个").into(), true)),
             Some(Err(e)) => st.message = Some((e.into(), true)),
             Some(Ok(h)) => self.apply_hotkey(h),
         }
@@ -459,15 +469,15 @@ impl SwiftFindApp {
             self.hotkey = h;
             self.notice = None;
             match hotkey::save(&h) {
-                Ok(()) => (format!("已设置为 {}", h.label()), false),
-                Err(e) => (format!("已设置为 {}，但保存失败：{e}", h.label()), true),
+                Ok(()) => (trf!("Set to {}", "已设置为 {}", h.label()), false),
+                Err(e) => (trf!("Set to {}, but saving failed: {e}", "已设置为 {}，但保存失败：{e}", h.label()), true),
             }
         } else {
             // Put the previous one back (fails too if it was never available).
             if !self.tray.set_hotkey(old) {
-                self.notice = Some(format!("热键 {} 不可用", old.label()));
+                self.notice = Some(trf!("Hotkey {} is unavailable", "热键 {} 不可用", old.label()));
             }
-            (format!("{} 已被其他程序占用或被系统保留，请换一个", h.label()), true)
+            (trf!("{} is taken by another program or reserved by the system; try another", "{} 已被其他程序占用或被系统保留，请换一个", h.label()), true)
         };
         if let Some(st) = self.settings.as_mut() {
             st.recording = false;
@@ -784,20 +794,20 @@ impl SwiftFindApp {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .child(menu_item("m-open", "打开", "Enter", cx, |r, _| os::open(&r.full)))
-                    .child(menu_item("m-reveal", "打开所在文件夹", "Ctrl+Enter", cx, |r, _| os::reveal(&r.full)))
+                    .child(menu_item("m-open", tr!("Open", "打开"), "Enter", cx, |r, _| os::open(&r.full)))
+                    .child(menu_item("m-reveal", tr!("Open containing folder", "打开所在文件夹"), "Ctrl+Enter", cx, |r, _| os::reveal(&r.full)))
                     .child(menu_separator(&t))
-                    .child(menu_item("m-copy-full", "复制完整路径", "Ctrl+Shift+C", cx, |r, cx| {
+                    .child(menu_item("m-copy-full", tr!("Copy full path", "复制完整路径"), "Ctrl+Shift+C", cx, |r, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(r.full.to_string()))
                     }))
-                    .child(menu_item("m-copy-name", "复制名称", "", cx, |r, cx| {
+                    .child(menu_item("m-copy-name", tr!("Copy name", "复制名称"), "", cx, |r, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(r.name.to_string()))
                     }))
-                    .child(menu_item("m-copy-dir", "复制所在文件夹路径", "", cx, |r, cx| {
+                    .child(menu_item("m-copy-dir", tr!("Copy folder path", "复制所在文件夹路径"), "", cx, |r, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(r.path.to_string()))
                     }))
                     .child(menu_separator(&t))
-                    .child(menu_item("m-props", "属性", "", cx, |r, _| os::properties(&r.full))),
+                    .child(menu_item("m-props", tr!("Properties", "属性"), "", cx, |r, _| os::properties(&r.full))),
             ),
         )
         .with_priority(1)
@@ -909,7 +919,7 @@ impl Render for SwiftFindApp {
                             .rounded_sm()
                             .text_color(t.muted)
                             .hover(|s| s.bg(t.button_hover))
-                            .child("设置")
+                            .child(tr!("Settings", "设置"))
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_settings(window, cx))),
                     ),
             )
@@ -925,19 +935,19 @@ impl Render for SwiftFindApp {
                     .border_color(t.chrome_border)
                     .text_color(t.muted)
                     .child(
-                        self.header_cell("名称", SortKey::Name, cx)
+                        self.header_cell(tr!("Name", "名称"), SortKey::Name, cx)
                             .w(px(cols.name))
                             .flex_none(),
                     )
-                    .child(self.header_cell("路径", SortKey::Path, cx).flex_grow(1.).flex_basis(px(0.)).min_w_0())
+                    .child(self.header_cell(tr!("Path", "路径"), SortKey::Path, cx).flex_grow(1.).flex_basis(px(0.)).min_w_0())
                     .child(
-                        self.header_cell("大小", SortKey::Size, cx)
+                        self.header_cell(tr!("Size", "大小"), SortKey::Size, cx)
                             .w(px(cols.size))
                             .flex_none()
                             .justify_end(),
                     )
                     .child(
-                        self.header_cell("修改时间", SortKey::Modified, cx)
+                        self.header_cell(tr!("Date modified", "修改时间"), SortKey::Modified, cx)
                             .w(px(cols.date))
                             .flex_none(),
                     )
@@ -969,12 +979,13 @@ impl Render for SwiftFindApp {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(format!("{count} 个对象"))
+                            .child(if count == 1 { tr!("1 object", "1 个对象").to_string() } else { trf!("{count} objects", "{count} 个对象") })
                             .when_some(self.query_error.clone(), |d, e| d.child(div().text_color(t.error).child(e))),
                     )
                     .child(format!(
-                        "{}{status}  ·  搜索 {:.1} ms",
+                        "{}{status}  ·  {} {:.1} ms",
                         self.notice.as_ref().map(|n| format!("{n}  ·  ")).unwrap_or_default(),
+                        tr!("search", "搜索"),
                         self.search_time.as_secs_f64() * 1000.
                     )),
             );
@@ -1008,7 +1019,7 @@ impl SwiftFindApp {
         let st = self.settings.as_ref().unwrap();
         let recording = st.recording;
         let t = theme::get(cx);
-        let key_text = if recording { "请按下新的组合键…".to_string() } else { self.hotkey.label() };
+        let key_text = if recording { tr!("Press the new key combination…", "请按下新的组合键…").to_string() } else { self.hotkey.label() };
         div()
             .absolute()
             .top_0()
@@ -1034,14 +1045,14 @@ impl SwiftFindApp {
                     .text_size(px(13.))
                     .rounded_lg()
                     .shadow_lg()
-                    .child(div().text_size(px(16.)).child("设置"))
+                    .child(div().text_size(px(16.)).child(tr!("Settings", "设置")))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .child("显示 / 隐藏窗口的全局热键")
+                            .child(tr!("Global hotkey to show / hide the window", "显示 / 隐藏窗口的全局热键"))
                             .child(
                                 div()
                                     .id("hotkey-field")
@@ -1065,9 +1076,12 @@ impl SwiftFindApp {
                             ),
                     )
                     .child(div().text_color(t.faint).child(if recording {
-                        "按 Esc 取消"
+                        tr!("Press Esc to cancel", "按 Esc 取消")
                     } else {
-                        "点击右侧按钮后按下新的组合键，需包含 Ctrl / Alt / Win，或使用 F1–F24"
+                        tr!(
+                            "Click the button on the right, then press a new combination with Ctrl / Alt / Win, or F1–F24",
+                            "点击右侧按钮后按下新的组合键，需包含 Ctrl / Alt / Win，或使用 F1–F24"
+                        )
                     }))
                     .child(
                         div()
@@ -1075,13 +1089,13 @@ impl SwiftFindApp {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .child("开机自动启动")
+                            .child(tr!("Start at logon", "开机自动启动"))
                             .child({
                                 let state = st.autostart;
                                 let label = match state {
                                     None => "…",
-                                    Some(true) => "已开启",
-                                    Some(false) => "已关闭",
+                                    Some(true) => tr!("On", "已开启"),
+                                    Some(false) => tr!("Off", "已关闭"),
                                 };
                                 button(&t, "autostart-toggle", label, state == Some(true))
                                     .min_w(px(170.))
@@ -1104,13 +1118,13 @@ impl SwiftFindApp {
                             .justify_end()
                             .gap_2()
                             .mt_2()
-                            .child(button(&t, "hotkey-default", format!("恢复默认（{}）", Hotkey::DEFAULT.label()), false).on_click(
+                            .child(button(&t, "hotkey-default", trf!("Reset to default ({})", "恢复默认（{}）", Hotkey::DEFAULT.label()), false).on_click(
                                 cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.apply_hotkey(Hotkey::DEFAULT);
                                     cx.notify();
                                 }),
                             ))
-                            .child(button(&t, "settings-close", "关闭", true).on_click(cx.listener(
+                            .child(button(&t, "settings-close", tr!("Close", "关闭"), true).on_click(cx.listener(
                                 |this, _: &ClickEvent, window, cx| this.close_settings(window, cx),
                             ))),
                     ),

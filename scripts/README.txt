@@ -13,6 +13,8 @@ SwiftFind {VERSION} — 快速文件名搜索
 - Enter 打开，Ctrl+Enter 打开所在文件夹，Ctrl+Shift+C 复制路径，右键有更多操作
 - 点击列标题排序，拖动列标题边缘调整列宽；Ctrl+, 打开设置（热键、开机自动启动）
 - 窗口位置、大小和列宽会自动记住
+- 界面语言跟随 Windows（中文或英文）。想固定一种，可在
+  %LOCALAPPDATA%\swiftfind\settings.ini 中加一行 language=zh（或 language=en）
 
 【搜索语法】（可与普通关键词任意组合，空格分隔）
 - 通配符：*.pdf   报告??.docx

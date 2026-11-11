@@ -15,7 +15,7 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 /// What the user asked for, via hotkey / tray / second instance.
 #[derive(Debug, Clone, Copy)]
@@ -218,10 +218,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn show_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("显示 SwiftFind"));
-        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置…"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, &HSTRING::from(tr!("Show SwiftFind", "显示 SwiftFind")));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, &HSTRING::from(tr!("Settings…", "设置…")));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, &HSTRING::from(tr!("Quit", "退出")));
         let _ = SetMenuDefaultItem(menu, MENU_SHOW as u32, 0);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);

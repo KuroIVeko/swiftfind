@@ -94,7 +94,7 @@ pub fn start(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
 }
 
 fn full_scan(shared: &Shared, vol: &mut NtfsVolume) -> anyhow::Result<()> {
-    shared.set_status(format!("正在索引 {}: ...", vol.letter));
+    shared.set_status(trf!("Indexing {}: ...", "正在索引 {}: ...", vol.letter));
     let t = Instant::now();
     let scan = match vol.scan_mft() {
         Ok(scan) => scan,
@@ -193,9 +193,9 @@ fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
 
     let letters: String = volumes.iter().map(|v| format!("{}: ", v.letter)).collect();
     if errors.is_empty() {
-        shared.set_status(format!("已索引 {letters}"));
+        shared.set_status(trf!("Indexed {letters}", "已索引 {letters}"));
     } else {
-        shared.set_status(format!("已索引 {letters}| 失败: {}", errors.join("; ")));
+        shared.set_status(trf!("Indexed {letters}| failed: {}", "已索引 {letters}| 失败: {}", errors.join("; ")));
     }
     // A full scan is expensive to repeat, so write it right away. Journal
     // replays are cheap and are saved on hide / exit / hourly.

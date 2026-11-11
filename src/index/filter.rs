@@ -55,14 +55,16 @@ pub fn parse(token: &str, today: NaiveDate) -> Token {
         "size" if value.is_empty() => Token::Incomplete,
         "size" => match size_range(value) {
             Some(r) => Token::Filter(Filter::Size(r), None),
-            None => Token::Error(format!(
+            None => Token::Error(trf!(
+                "Unrecognized size:{value} (e.g. size:>10mb, size:1m..20m)",
                 "无法识别 size:{value}（示例：size:>10mb、size:1m..20m）"
             )),
         },
         "dm" | "datemodified" if value.is_empty() => Token::Incomplete,
         "dm" | "datemodified" => match date_range(value, today) {
             Some(r) => Token::Filter(Filter::Modified(r), None),
-            None => Token::Error(format!(
+            None => Token::Error(trf!(
+                "Unrecognized {key}:{value} (e.g. dm:today, dm:2024-05, dm:>=2024-05-01)",
                 "无法识别 {key}:{value}（示例：dm:today、dm:2024-05、dm:>=2024-05-01）"
             )),
         },

@@ -41,6 +41,7 @@ features = [
     "Win32_UI_Controls",
     "Win32_UI_Shell_Common",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Globalization",
 ]
 
 # Same patches Zed's own workspace applies; gpui relies on them.
