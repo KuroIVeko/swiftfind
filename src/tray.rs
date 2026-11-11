@@ -4,14 +4,16 @@
 //! icon callbacks and "show yourself" requests from a second instance. Events
 //! are forwarded to the UI thread through a channel.
 
+use crate::hotkey::Hotkey;
 use futures::channel::mpsc::UnboundedSender;
+use parking_lot::Mutex;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -22,29 +24,45 @@ pub enum TrayEvent {
     /// Hotkey: hide if in front, otherwise show.
     Toggle,
     Show,
+    /// Show the window with the settings panel open.
+    Settings,
     Quit,
 }
 
-pub const HOTKEY_LABEL: &str = "Ctrl+Shift+E";
 const CLASS: PCWSTR = w!("SwiftFindTray");
 /// Tray icon callback.
 const WM_TRAY: u32 = WM_APP + 1;
 /// Sent by a second instance (possibly unelevated).
 const WM_SHOW_REQUEST: u32 = WM_APP + 2;
+/// wparam: packed [`Hotkey`] to register in place of the current one.
+/// Returns 1 on success.
+const WM_SET_HOTKEY: u32 = WM_APP + 3;
 const MENU_SHOW: usize = 1;
 const MENU_QUIT: usize = 2;
+const MENU_SETTINGS: usize = 3;
 const HOTKEY_ID: i32 = 1;
 
 static EVENTS: OnceLock<UnboundedSender<TrayEvent>> = OnceLock::new();
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 static ICON: OnceLock<isize> = OnceLock::new();
+/// Tooltip of the tray icon (mentions the current hotkey).
+static TIP: Mutex<String> = Mutex::new(String::new());
 
+#[derive(Clone, Copy)]
 pub struct Tray {
     hwnd: isize,
     pub hotkey_ok: bool,
 }
 
 impl Tray {
+    /// Replaces the global hotkey. Returns false if the combination is taken
+    /// or reserved; no hotkey is registered then.
+    pub fn set_hotkey(&self, hotkey: Hotkey) -> bool {
+        let w = hotkey.pack();
+        let r = unsafe { SendMessageW(HWND(self.hwnd as _), WM_SET_HOTKEY, Some(WPARAM(w)), Some(LPARAM(0))) };
+        r.0 == 1
+    }
+
     /// Removes the icon (otherwise it lingers until hovered after exit).
     pub fn remove(&self) {
         let nid = notify_data(HWND(self.hwnd as _));
@@ -72,8 +90,9 @@ pub fn icon() -> HICON {
     HICON(*ICON.get_or_init(|| make_icon().0 as isize) as _)
 }
 
-pub fn start(events: UnboundedSender<TrayEvent>) -> Tray {
+pub fn start(events: UnboundedSender<TrayEvent>, hotkey: Hotkey) -> Tray {
     EVENTS.set(events).ok();
+    *TIP.lock() = tip_for(&hotkey);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("tray".into())
@@ -102,8 +121,7 @@ pub fn start(events: UnboundedSender<TrayEvent>) -> Tray {
             // Let an unelevated second instance reach us through UIPI.
             let _ = ChangeWindowMessageFilterEx(hwnd, WM_SHOW_REQUEST, MSGFLT_ALLOW, None);
             add_icon(hwnd);
-            let hotkey_ok =
-                RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, b'E' as u32).is_ok();
+            let hotkey_ok = register(hwnd, &hotkey);
             tx.send(Tray { hwnd: hwnd.0 as isize, hotkey_ok }).ok();
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -113,6 +131,15 @@ pub fn start(events: UnboundedSender<TrayEvent>) -> Tray {
         })
         .expect("spawn tray thread");
     rx.recv().expect("tray thread init")
+}
+
+fn tip_for(h: &Hotkey) -> String {
+    format!("SwiftFind ({})", h.label())
+}
+
+/// Must run on the tray thread (hotkeys belong to the thread of their window).
+fn register(hwnd: HWND, h: &Hotkey) -> bool {
+    unsafe { RegisterHotKey(Some(hwnd), HOTKEY_ID, h.modifiers() | MOD_NOREPEAT, h.vk).is_ok() }
 }
 
 fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -125,7 +152,7 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
         hIcon: icon(),
         ..Default::default()
     };
-    let tip: Vec<u16> = format!("SwiftFind ({HOTKEY_LABEL})").encode_utf16().collect();
+    let tip: Vec<u16> = TIP.lock().encode_utf16().take(nid.szTip.len() - 1).collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     nid
 }
@@ -146,6 +173,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => send(TrayEvent::Toggle),
         WM_SHOW_REQUEST => send(TrayEvent::Show),
+        WM_SET_HOTKEY => unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            let h = Hotkey::unpack(wparam.0);
+            if !register(hwnd, &h) {
+                return LRESULT(0);
+            }
+            *TIP.lock() = tip_for(&h);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &notify_data(hwnd));
+            return LRESULT(1);
+        },
         WM_TRAY => match (lparam.0 & 0xFFFF) as u32 {
             WM_LBUTTONUP => send(TrayEvent::Show),
             WM_RBUTTONUP => show_menu(hwnd),
@@ -161,6 +198,7 @@ fn show_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("显示 SwiftFind"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
         let _ = SetMenuDefaultItem(menu, MENU_SHOW as u32, 0);
@@ -172,6 +210,7 @@ fn show_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
         match cmd.0 as usize {
             MENU_SHOW => send(TrayEvent::Show),
+            MENU_SETTINGS => send(TrayEvent::Settings),
             MENU_QUIT => send(TrayEvent::Quit),
             _ => {}
         }

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod hotkey;
 mod index;
 mod indexer;
 mod mft;
@@ -81,8 +82,9 @@ fn main() {
     indexer::start(shared.clone(), None);
 
     let (events_tx, mut events) = futures::channel::mpsc::unbounded();
-    let tray = tray::start(events_tx);
-    let notice = (!tray.hotkey_ok).then(|| format!("热键 {} 已被其他程序占用", tray::HOTKEY_LABEL));
+    let hotkey = hotkey::load();
+    let tray = tray::start(events_tx, hotkey);
+    let notice = (!tray.hotkey_ok).then(|| format!("热键 {} 已被其他程序占用，可在设置中更换", hotkey.label()));
     if let Some(n) = &notice {
         indexer::log(n.clone());
     }
@@ -109,7 +111,7 @@ fn main() {
                         os::window::hide(hwnd);
                         false
                     });
-                    cx.new(|cx| app::SwiftFindApp::new(shared.clone(), notice, window, cx))
+                    cx.new(|cx| app::SwiftFindApp::new(shared.clone(), tray, hotkey, notice, window, cx))
                 },
             )
             .expect("open window");
@@ -117,11 +119,23 @@ fn main() {
         cx.spawn(async move |cx| {
             while let Some(event) = events.next().await {
                 let show = match event {
+                    TrayEvent::Toggle
+                        if main
+                            .update(cx, |app, _, cx| app.hotkey_pressed_while_recording(cx))
+                            .unwrap_or(false) =>
+                    {
+                        continue;
+                    }
                     TrayEvent::Toggle if os::window::is_front(hwnd) => {
                         os::window::hide(hwnd);
                         false
                     }
                     TrayEvent::Toggle | TrayEvent::Show => true,
+                    TrayEvent::Settings => {
+                        os::window::show(hwnd);
+                        main.update(cx, |app, window, cx| app.open_settings(window, cx)).ok();
+                        continue;
+                    }
                     TrayEvent::Quit => {
                         shared.save_if_dirty();
                         tray.remove();

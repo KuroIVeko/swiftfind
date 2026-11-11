@@ -1,14 +1,16 @@
 //! Main window: search box, sortable virtualized result list, context menu
 //! and status bar.
 
+use crate::hotkey::{self, Hotkey};
 use crate::index::{Query, SortKey, Stat};
+use crate::tray::Tray;
 use crate::indexer::Shared;
 use crate::os;
 use crate::text_input::{self, Changed, TextInput};
 use gpui::{
     App, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*, px, rgb,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*, px, rgb, rgba,
     uniform_list,
 };
 use std::collections::HashMap;
@@ -18,7 +20,17 @@ use std::time::{Duration, Instant};
 
 actions!(
     swiftfind,
-    [SelectNext, SelectPrev, SelectFirst, SelectLast, OpenSelected, RevealSelected, CopyPath, Dismiss]
+    [
+        SelectNext,
+        SelectPrev,
+        SelectFirst,
+        SelectLast,
+        OpenSelected,
+        RevealSelected,
+        CopyPath,
+        Dismiss,
+        OpenSettings
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -32,6 +44,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-enter", RevealSelected, Some("SwiftFind")),
         KeyBinding::new("ctrl-shift-c", CopyPath, Some("SwiftFind")),
         KeyBinding::new("escape", Dismiss, Some("SwiftFind")),
+        KeyBinding::new("ctrl-,", OpenSettings, Some("SwiftFind")),
     ]);
 }
 
@@ -46,6 +59,15 @@ struct Row {
     full: Arc<str>,
     size: SharedString,
     modified: SharedString,
+}
+
+/// State of the settings panel while it is open.
+struct Settings {
+    focus: FocusHandle,
+    /// Waiting for the user to press a new hotkey.
+    recording: bool,
+    /// (text, is_error)
+    message: Option<(String, bool)>,
 }
 
 /// Open context menu for one result.
@@ -74,13 +96,23 @@ pub struct SwiftFindApp {
     sort: SortKey,
     sort_desc: bool,
     menu: Option<Menu>,
+    settings: Option<Settings>,
+    tray: Tray,
+    hotkey: Hotkey,
     /// Shown in the status bar (e.g. hotkey registration failure).
     notice: Option<String>,
     focus_handle: FocusHandle,
 }
 
 impl SwiftFindApp {
-    pub fn new(shared: Arc<Shared>, notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        shared: Arc<Shared>,
+        tray: Tray,
+        hotkey: Hotkey,
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| TextInput::new("搜索文件名…（空格分隔多个关键词，支持 * ? 通配符）", cx));
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
             this.selected = None;
@@ -125,6 +157,9 @@ impl SwiftFindApp {
             sort: SortKey::Name,
             sort_desc: false,
             menu: None,
+            settings: None,
+            tray,
+            hotkey,
             notice,
             focus_handle: cx.focus_handle(),
         };
@@ -175,9 +210,92 @@ impl SwiftFindApp {
 
     /// Focuses the search box with its text selected (after the window is shown).
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return; // keep the open settings panel focused
+        }
         self.menu = None;
         window.focus(&self.input.focus_handle(cx), cx);
         self.input.update(cx, |input, cx| input.select_all_text(window, cx));
+    }
+
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        self.settings = Some(Settings { focus, recording: false, message: None });
+        cx.notify();
+    }
+
+    fn open_settings_action(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings = None;
+        window.focus(&self.input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// The current global hotkey can't reach the window (the system takes
+    /// it), so the tray reports it instead. Returns true if it was consumed.
+    pub fn hotkey_pressed_while_recording(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(st) = self.settings.as_mut().filter(|s| s.recording) else { return false };
+        st.recording = false;
+        st.message = Some((format!("仍为 {}", self.hotkey.label()), false));
+        cx.notify();
+        true
+    }
+
+    fn settings_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(st) = self.settings.as_mut() else { return };
+        let k = &ev.keystroke;
+        cx.stop_propagation();
+        if !st.recording {
+            if k.key == "escape" {
+                self.close_settings(window, cx);
+            }
+            return;
+        }
+        match k.key.as_str() {
+            "shift" | "control" | "alt" | "platform" | "function" => return,
+            "escape" => {
+                st.recording = false;
+                st.message = None;
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+        let m = &k.modifiers;
+        let candidate = Hotkey::from_keystroke(m.control, m.alt, m.shift, m.platform, &k.key);
+        match candidate.map(|h| h.validate().map(|_| h)) {
+            None => st.message = Some(("不支持这个按键，请换一个".into(), true)),
+            Some(Err(e)) => st.message = Some((e.into(), true)),
+            Some(Ok(h)) => self.apply_hotkey(h),
+        }
+        cx.notify();
+    }
+
+    fn apply_hotkey(&mut self, h: Hotkey) {
+        let old = self.hotkey;
+        let message = if self.tray.set_hotkey(h) {
+            self.hotkey = h;
+            self.notice = None;
+            match hotkey::save(&h) {
+                Ok(()) => (format!("已设置为 {}", h.label()), false),
+                Err(e) => (format!("已设置为 {}，但保存失败：{e}", h.label()), true),
+            }
+        } else {
+            // Put the previous one back (fails too if it was never available).
+            if !self.tray.set_hotkey(old) {
+                self.notice = Some(format!("热键 {} 不可用", old.label()));
+            }
+            (format!("{} 已被其他程序占用或被系统保留，请换一个", h.label()), true)
+        };
+        if let Some(st) = self.settings.as_mut() {
+            st.recording = false;
+            st.message = Some(message);
+        }
     }
 
     /// Header click: same column flips direction; a new column starts
@@ -482,7 +600,7 @@ impl Render for SwiftFindApp {
         .flex_grow(1.)
         .w_full();
 
-        div()
+        let main = div()
             .key_context("SwiftFind")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next))
@@ -493,13 +611,34 @@ impl Render for SwiftFindApp {
             .on_action(cx.listener(Self::reveal_selected))
             .on_action(cx.listener(Self::copy_path))
             .on_action(cx.listener(Self::dismiss))
+            .on_action(cx.listener(Self::open_settings_action))
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0xffffff))
             .text_color(rgb(0x1e1e1e))
             .text_size(px(13.))
-            .child(div().p_2().bg(rgb(0xf3f3f3)).child(self.input.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .bg(rgb(0xf3f3f3))
+                    .child(div().flex_grow(1.).min_w_0().child(self.input.clone()))
+                    .child(
+                        div()
+                            .id("settings-button")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_color(rgb(0x555555))
+                            .hover(|s| s.bg(rgb(0xe0e0e0)))
+                            .child("设置")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_settings(window, cx))),
+                    ),
+            )
             .child(
                 div()
                     .flex()
@@ -535,6 +674,117 @@ impl Render for SwiftFindApp {
                         self.notice.as_ref().map(|n| format!("{n}  ·  ")).unwrap_or_default(),
                         self.search_time.as_secs_f64() * 1000.
                     )),
+            );
+
+        // The settings panel sits outside the "SwiftFind" key context, so the
+        // list's bindings (Enter, Esc, ...) don't fire while recording a key.
+        div()
+            .relative()
+            .size_full()
+            .child(main)
+            .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
+    }
+}
+
+fn button(id: &'static str, label: impl Into<SharedString>, primary: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(if primary { rgb(0x1f6fd6) } else { rgb(0xcccccc) })
+        .bg(if primary { rgb(0x1f6fd6) } else { rgb(0xffffff) })
+        .text_color(if primary { rgb(0xffffff) } else { rgb(0x1e1e1e) })
+        .hover(|s| s.opacity(0.85))
+        .child(label.into())
+}
+
+impl SwiftFindApp {
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let st = self.settings.as_ref().unwrap();
+        let recording = st.recording;
+        let key_text = if recording { "请按下新的组合键…".to_string() } else { self.hotkey.label() };
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000033))
+            .occlude()
+            .child(
+                div()
+                    .key_context("Settings")
+                    .track_focus(&st.focus)
+                    .on_key_down(cx.listener(Self::settings_key))
+                    .w(px(460.))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .bg(rgb(0xffffff))
+                    .text_color(rgb(0x1e1e1e))
+                    .text_size(px(13.))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .child(div().text_size(px(16.)).child("设置"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child("显示 / 隐藏窗口的全局热键")
+                            .child(
+                                div()
+                                    .id("hotkey-field")
+                                    .min_w(px(170.))
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if recording { rgb(0x1f6fd6) } else { rgb(0xcccccc) })
+                                    .bg(if recording { rgb(0xeef5ff) } else { rgb(0xfafafa) })
+                                    .text_center()
+                                    .child(key_text)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        if let Some(st) = this.settings.as_mut() {
+                                            st.recording = true;
+                                            st.message = None;
+                                            window.focus(&st.focus, cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().text_color(rgb(0x888888)).child(if recording {
+                        "按 Esc 取消"
+                    } else {
+                        "点击右侧按钮后按下新的组合键，需包含 Ctrl / Alt / Win，或使用 F1–F24"
+                    }))
+                    .when_some(st.message.clone(), |d, (text, is_error)| {
+                        d.child(div().text_color(if is_error { rgb(0xc42b1c) } else { rgb(0x107c10) }).child(text))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .mt_2()
+                            .child(button("hotkey-default", format!("恢复默认（{}）", Hotkey::DEFAULT.label()), false).on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.apply_hotkey(Hotkey::DEFAULT);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button("settings-close", "关闭", true).on_click(cx.listener(
+                                |this, _: &ClickEvent, window, cx| this.close_settings(window, cx),
+                            ))),
+                    ),
             )
     }
 }
