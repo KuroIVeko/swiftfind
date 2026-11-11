@@ -19,6 +19,16 @@ impl Shared {
     }
 }
 
+/// Logs to stderr and to `%TEMP%\everything.log` (release builds have no console).
+fn log(msg: String) {
+    use std::io::Write;
+    eprintln!("{msg}");
+    let path = std::env::temp_dir().join("everything.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} {msg}", chrono::Local::now().format("%H:%M:%S%.3f"));
+    }
+}
+
 pub fn start(shared: Arc<Shared>) {
     std::thread::Builder::new()
         .name("indexer".into())
@@ -31,8 +41,16 @@ fn full_scan(shared: &Shared, vol: &mut NtfsVolume) -> anyhow::Result<()> {
     let t = Instant::now();
     let records = vol.enumerate()?;
     let n = records.len();
+    let t_enum = t.elapsed();
     shared.index.write().add_volume(vol.letter, vol.root_frn, records);
-    eprintln!("indexed {}: {} records in {:?}", vol.letter, n, t.elapsed());
+    log(format!(
+        "indexed {}: {} records in {:?} (read MFT {:?}, build index {:?})",
+        vol.letter,
+        n,
+        t.elapsed(),
+        t_enum,
+        t.elapsed() - t_enum
+    ));
     Ok(())
 }
 
@@ -43,7 +61,7 @@ fn run(shared: Arc<Shared>) {
         match NtfsVolume::open(letter).and_then(|mut v| full_scan(&shared, &mut v).map(|_| v)) {
             Ok(v) => volumes.push(v),
             Err(e) => {
-                eprintln!("volume {letter}: {e:#}");
+                log(format!("volume {letter}: {e:#}"));
                 errors.push(format!("{letter}: {e:#}"));
             }
         }
@@ -62,14 +80,14 @@ fn run(shared: Arc<Shared>) {
             match vol.read_changes(|c| changes.push(c)) {
                 Ok(()) => {}
                 Err(JournalError::Reset) => {
-                    eprintln!("USN journal reset on {}:, re-indexing", vol.letter);
+                    log(format!("USN journal reset on {}:, re-indexing", vol.letter));
                     if let Err(e) = vol.reset_journal().and_then(|_| full_scan(&shared, vol)) {
-                        eprintln!("re-index {}: {e:#}", vol.letter);
+                        log(format!("re-index {}: {e:#}", vol.letter));
                     }
                     continue;
                 }
                 Err(JournalError::Other(e)) => {
-                    eprintln!("read journal {}: {e:#}", vol.letter);
+                    log(format!("read journal {}: {e:#}", vol.letter));
                     continue;
                 }
             }
