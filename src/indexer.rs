@@ -38,12 +38,14 @@ impl Shared {
             return;
         }
         let t = Instant::now();
-        let snapshot = self.index.read().snapshot();
-        let t_snap = t.elapsed();
-        let result = persist::save(&persist::cache_path(), &snapshot);
-        drop(snapshot);
+        // Streams straight from the index under a read lock (~0.2 s); only
+        // the indexer thread writes, and it is either us or briefly blocked.
+        let result = {
+            let index = self.index.read();
+            persist::save(&persist::cache_path(), &index.live_view())
+        };
         match result {
-            Ok(()) => log(format!("saved cache in {:?} (snapshot {t_snap:?})", t.elapsed())),
+            Ok(()) => log(format!("saved cache in {:?}", t.elapsed())),
             Err(e) => {
                 self.dirty.store(true, Ordering::SeqCst);
                 log(format!("save cache: {e:#}"));

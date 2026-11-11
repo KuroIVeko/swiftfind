@@ -112,6 +112,53 @@ impl VolumeScan {
     }
 }
 
+/// See [`Index::live_view`].
+pub struct LiveView<'a> {
+    index: &'a Index,
+    /// Entry index -> MFT record number (u64::MAX if unmapped).
+    rec_of: Vec<u64>,
+}
+
+impl LiveView<'_> {
+    pub fn volume_count(&self) -> usize {
+        self.index.volumes.len()
+    }
+
+    pub fn volume(&self, v: usize) -> (char, VolumeMeta) {
+        let vol = &self.index.volumes[v];
+        (vol.letter, vol.meta)
+    }
+
+    /// (live record count, total name bytes) of volume `v`.
+    pub fn stats(&self, v: usize) -> (usize, usize) {
+        let (mut n, mut bytes) = (0, 0);
+        self.for_each(v, |_, _, name, _| {
+            n += 1;
+            bytes += name.len();
+        });
+        (n, bytes)
+    }
+
+    /// Calls `f(record, parent_record, name, is_dir)` for every live, non-root
+    /// entry of volume `v`, in record-number order.
+    pub fn for_each(&self, v: usize, mut f: impl FnMut(u64, u64, &str, bool)) {
+        let index = self.index;
+        let vol = &index.volumes[v];
+        let root_rec = record_no(vol.meta.root_frn) as u64;
+        for (rec, &idx) in vol.by_record.iter().enumerate() {
+            if idx == NONE || idx == vol.root || !index.is_alive(idx) {
+                continue;
+            }
+            let e = &index.entries[idx as usize];
+            let parent = match self.rec_of.get(e.parent as usize) {
+                Some(&p) if p != u64::MAX => p,
+                _ => root_rec,
+            };
+            f(rec as u64, parent, index.name(idx), e.flags & FLAG_DIR != 0);
+        }
+    }
+}
+
 pub struct Volume {
     /// e.g. 'C'
     pub letter: char,
@@ -309,8 +356,9 @@ impl Index {
         self.rebuild_order();
     }
 
-    /// Extracts the live contents of every volume, for writing the cache.
-    pub fn snapshot(&self) -> Vec<VolumeScan> {
+    /// Read-only view of the live records, for writing the cache without
+    /// copying the index.
+    pub fn live_view(&self) -> LiveView<'_> {
         let mut rec_of = vec![u64::MAX; self.entries.len()];
         for v in &self.volumes {
             for (rec, &idx) in v.by_record.iter().enumerate() {
@@ -319,22 +367,18 @@ impl Index {
                 }
             }
         }
-        self.volumes
-            .iter()
+        LiveView { index: self, rec_of }
+    }
+
+    /// Copies the live contents of every volume (used to build a compacted index).
+    pub fn snapshot(&self) -> Vec<VolumeScan> {
+        let view = self.live_view();
+        (0..self.volumes.len())
             .map(|v| {
-                let live = v.by_record.iter().filter(|&&i| i != NONE).count();
-                let mut scan = VolumeScan::with_capacity(v.letter, v.meta, live, live * 16);
-                for (rec, &idx) in v.by_record.iter().enumerate() {
-                    if idx == NONE || idx == v.root || !self.is_alive(idx) {
-                        continue;
-                    }
-                    let e = &self.entries[idx as usize];
-                    let parent = match rec_of.get(e.parent as usize) {
-                        Some(&p) if p != u64::MAX => p,
-                        _ => record_no(v.meta.root_frn) as u64,
-                    };
-                    scan.push_str(rec as u64, parent, self.name(idx), e.flags & FLAG_DIR != 0);
-                }
+                let (letter, meta) = view.volume(v);
+                let (count, name_bytes) = view.stats(v);
+                let mut scan = VolumeScan::with_capacity(letter, meta, count, name_bytes);
+                view.for_each(v, |rec, parent, name, is_dir| scan.push_str(rec, parent, name, is_dir));
                 scan
             })
             .collect()

@@ -10,7 +10,7 @@
 //! ```
 //! Names are stored back to back in record order, so offsets are implicit.
 
-use crate::index::{VolumeMeta, VolumeScan};
+use crate::index::{LiveView, VolumeMeta, VolumeScan};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -23,38 +23,88 @@ pub fn cache_path() -> PathBuf {
     base.join("swiftfind").join("index.bin")
 }
 
-pub fn save(path: &Path, scans: &[VolumeScan]) -> Result<()> {
+/// Anything whose per-volume records can be written to the cache.
+pub trait CacheSource {
+    fn volume_count(&self) -> usize;
+    fn volume(&self, v: usize) -> (char, VolumeMeta);
+    /// Calls `f(record, parent_record, name, is_dir)` for every record.
+    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool));
+}
+
+impl CacheSource for LiveView<'_> {
+    fn volume_count(&self) -> usize {
+        LiveView::volume_count(self)
+    }
+    fn volume(&self, v: usize) -> (char, VolumeMeta) {
+        LiveView::volume(self, v)
+    }
+    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool)) {
+        LiveView::for_each(self, v, f)
+    }
+}
+
+impl CacheSource for [VolumeScan] {
+    fn volume_count(&self) -> usize {
+        self.len()
+    }
+    fn volume(&self, v: usize) -> (char, VolumeMeta) {
+        (self[v].letter, self[v].meta)
+    }
+    fn for_each(&self, v: usize, f: &mut dyn FnMut(u64, u64, &str, bool)) {
+        let s = &self[v];
+        for r in &s.recs {
+            f(r.rec, r.parent, s.name(r), r.is_dir);
+        }
+    }
+}
+
+/// Writes the cache by streaming records from `src` (three passes per volume:
+/// sizes, names, records), so no copy of the index is needed.
+pub fn save(path: &Path, src: &(impl CacheSource + ?Sized)) -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     let tmp = path.with_extension("tmp");
     {
         let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp).context("create cache")?);
         w.write_all(MAGIC)?;
         w.write_all(&VERSION.to_le_bytes())?;
-        w.write_all(&(scans.len() as u32).to_le_bytes())?;
-        for s in scans {
-            let m = &s.meta;
-            w.write_all(&[s.letter as u8])?;
+        w.write_all(&(src.volume_count() as u32).to_le_bytes())?;
+        for v in 0..src.volume_count() {
+            let (letter, m) = src.volume(v);
+            w.write_all(&[letter as u8])?;
             w.write_all(&m.serial.to_le_bytes())?;
             w.write_all(&m.root_frn.to_le_bytes())?;
             w.write_all(&m.journal_id.to_le_bytes())?;
             w.write_all(&m.next_usn.to_le_bytes())?;
-            w.write_all(&(s.recs.len() as u64).to_le_bytes())?;
-            // Names in record order (they are already contiguous for scans
-            // produced by this program, but don't rely on it).
-            let names_len: u64 = s.recs.iter().map(|r| r.name_len as u64).sum();
+
+            let (mut count, mut names_len, mut too_large) = (0u64, 0u64, false);
+            src.for_each(v, &mut |rec, parent, name, _| {
+                count += 1;
+                names_len += name.len() as u64;
+                too_large |= rec > u32::MAX as u64 || parent > u32::MAX as u64;
+            });
+            if too_large {
+                bail!("MFT record number too large for cache format");
+            }
+            w.write_all(&count.to_le_bytes())?;
             w.write_all(&names_len.to_le_bytes())?;
-            for r in &s.recs {
-                w.write_all(s.name(r).as_bytes())?;
-            }
-            for r in &s.recs {
-                let (Ok(rec), Ok(parent)) = (u32::try_from(r.rec), u32::try_from(r.parent)) else {
-                    bail!("MFT record number too large for cache format");
-                };
-                w.write_all(&rec.to_le_bytes())?;
-                w.write_all(&parent.to_le_bytes())?;
-                w.write_all(&r.name_len.to_le_bytes())?;
-                w.write_all(&[r.is_dir as u8])?;
-            }
+
+            let mut err = Ok(());
+            src.for_each(v, &mut |_, _, name, _| {
+                if err.is_ok() {
+                    err = w.write_all(name.as_bytes());
+                }
+            });
+            src.for_each(v, &mut |rec, parent, name, is_dir| {
+                if err.is_ok() {
+                    let mut buf = [0u8; 11];
+                    buf[0..4].copy_from_slice(&(rec as u32).to_le_bytes());
+                    buf[4..8].copy_from_slice(&(parent as u32).to_le_bytes());
+                    buf[8..10].copy_from_slice(&(name.len() as u16).to_le_bytes());
+                    buf[10] = is_dir as u8;
+                    err = w.write_all(&buf);
+                }
+            });
+            err?;
         }
         w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     }
@@ -140,7 +190,7 @@ mod tests {
         s.push_str(10, 5, "文件夹", true);
         s.push_str(11, 10, "a.txt", false);
         let path = std::env::temp_dir().join("swiftfind-test").join("idx.bin");
-        save(&path, &[s]).unwrap();
+        save(&path, &[s][..]).unwrap();
         let back = load(&path).unwrap();
         assert_eq!(back.len(), 1);
         let b = &back[0];
@@ -148,6 +198,33 @@ mod tests {
         let names: Vec<_> = b.recs.iter().map(|r| (r.rec, r.parent, b.name(r), r.is_dir)).collect();
         assert_eq!(names, [(10, 5, "文件夹", true), (11, 10, "a.txt", false)]);
         assert!(parse(&std::fs::read(&path).unwrap()[..20]).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn streaming_save_matches_snapshot() {
+        use crate::index::{Index, RawRecord};
+        let meta = VolumeMeta { serial: 1, root_frn: 5, journal_id: 2, next_usn: 3 };
+        let mut s = VolumeScan::new('C', meta);
+        s.push_str(10, 5, "Windows", true);
+        s.push_str(11, 10, "notepad.exe", false);
+        s.push_str(12, 5, "用户", true);
+        let mut idx = Index::default();
+        idx.add_volume(s);
+        idx.upsert('C', &RawRecord { frn: 13, parent_frn: 12, name: "新建.txt".into(), is_dir: false });
+        idx.remove('C', 11);
+
+        let path = std::env::temp_dir().join("swiftfind-test").join("stream.bin");
+        save(&path, &idx.live_view()).unwrap();
+        let loaded = load(&path).unwrap();
+        let expected = idx.snapshot();
+        let flat = |v: &[VolumeScan]| -> Vec<_> {
+            v.iter()
+                .flat_map(|s| s.recs.iter().map(move |r| (s.letter, s.meta, r.rec, r.parent, s.name(r).to_string(), r.is_dir)))
+                .collect()
+        };
+        assert_eq!(flat(&loaded), flat(&expected));
+        assert_eq!(flat(&loaded).len(), 3);
         let _ = std::fs::remove_file(&path);
     }
 }
