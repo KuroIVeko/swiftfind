@@ -170,11 +170,33 @@ fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
         for vol in &mut volumes {
             sync_volume(&shared, vol);
         }
+        // Only this thread mutates the index, so nothing can change between
+        // building the compacted copy and swapping it in.
+        if shared.index.read().needs_compaction() {
+            compact(&shared);
+        }
         if last_save.elapsed() >= SAVE_INTERVAL {
             shared.save_if_dirty();
             last_save = Instant::now();
         }
     }
+}
+
+pub fn compact(shared: &Shared) {
+    log(format!("compacting: {}", shared.index.read().memory_report()));
+    let t = Instant::now();
+    let fresh = shared.index.read().compacted();
+    let t_build = t.elapsed();
+    let old = std::mem::replace(&mut *shared.index.write(), fresh);
+    // Bump after the swap so the UI re-runs its query against the new epoch.
+    shared.index.read().generation.fetch_add(1, Ordering::Relaxed);
+    drop(old);
+    shared.dirty.store(true, Ordering::SeqCst);
+    log(format!(
+        "compacted in {:?} (build {t_build:?}): {}",
+        t.elapsed(),
+        shared.index.read().memory_report()
+    ));
 }
 
 /// Applies all pending journal entries of one volume to the index.

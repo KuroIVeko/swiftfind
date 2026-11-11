@@ -27,6 +27,9 @@ fn main() {
         let (tx, rx) = std::sync::mpsc::channel();
         indexer::start(shared.clone(), Some(Box::new(move || tx.send(()).unwrap())));
         rx.recv().ok();
+        if std::env::args().any(|a| a == "--compact") {
+            indexer::compact(&shared);
+        }
         for i in 1..=6 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             indexer::log(format!("no-ui: idle {}ms", i * 500));

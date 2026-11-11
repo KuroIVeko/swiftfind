@@ -130,7 +130,17 @@ pub struct Index {
     volumes: Vec<Volume>,
     /// Bumped on every mutation so the UI knows when to refresh.
     pub generation: AtomicU64,
+    /// Changes only when entry indices are reassigned (compaction). Result
+    /// lists holding entry indices from another epoch must not be used.
+    pub epoch: u64,
+    /// Bytes of `names` no longer referenced by a live entry.
+    garbage_bytes: usize,
 }
+
+/// Compact once at least this many entries are dead...
+const COMPACT_MIN_DEAD: usize = 64 * 1024;
+/// ...or this many name bytes are garbage, and either exceeds 10%.
+const COMPACT_MIN_GARBAGE: usize = 4 << 20;
 
 /// Spare capacity kept after growing: ~3% instead of the default doubling,
 /// which would commit hundreds of MB for a multi-million entry index.
@@ -256,8 +266,9 @@ impl Index {
         let letter = scan.letter;
         let existing = self.volume_index(letter);
         if let Some(v) = existing {
-            for e in self.entries.iter_mut().filter(|e| e.vol == v as u8) {
+            for e in self.entries.iter_mut().filter(|e| e.vol == v as u8 && e.flags & FLAG_ALIVE != 0) {
                 e.flags &= !FLAG_ALIVE;
+                self.garbage_bytes += e.name_len as usize;
             }
         }
         let vol = existing.unwrap_or(self.volumes.len()) as u8;
@@ -343,12 +354,42 @@ impl Index {
         let total: usize = parts.iter().map(|p| p.1).sum();
         let detail: Vec<String> = parts.iter().map(|(n, b)| format!("{n} {:.1}", mb(*b))).collect();
         format!(
-            "index heap {:.1} MB ({}), {} entries ({} live)",
+            "index heap {:.1} MB ({}), {} entries ({} live, {} dead), {:.1} MB stale names, epoch {}",
             mb(total),
             detail.join(", "),
             self.entries.len(),
-            self.order.len()
+            self.order.len(),
+            self.dead_entries(),
+            mb(self.garbage_bytes),
+            self.epoch
         )
+    }
+
+    /// Number of entry slots that no longer hold a live file.
+    fn dead_entries(&self) -> usize {
+        self.entries.len() - self.order.len() - self.volumes.len()
+    }
+
+    /// Whether enough dead entries / stale names piled up to be worth a rebuild.
+    pub fn needs_compaction(&self) -> bool {
+        let dead = self.dead_entries();
+        (dead >= COMPACT_MIN_DEAD && dead * 10 >= self.entries.len())
+            || (self.garbage_bytes >= COMPACT_MIN_GARBAGE && self.garbage_bytes * 10 >= self.names.len())
+    }
+
+    /// Builds a fresh copy containing only live data. Entry indices change, so
+    /// the copy gets a new `epoch`. Safe to call under a read lock; the caller
+    /// swaps the result in.
+    pub fn compacted(&self) -> Index {
+        let mut fresh = Index {
+            epoch: self.epoch + 1,
+            generation: AtomicU64::new(self.generation.load(AtomicOrdering::Relaxed)),
+            ..Default::default()
+        };
+        for scan in self.snapshot() {
+            fresh.add_volume(scan);
+        }
+        fresh
     }
 
     /// Records how far into the journal the index is up to date.
@@ -418,6 +459,7 @@ impl Index {
                 return;
             }
             if !same_name {
+                self.garbage_bytes += e.name_len as usize;
                 self.order_remove(existing);
                 let (name_off, name_len, lower_off, lower_len) = self.push_names(&r.name);
                 let e = &mut self.entries[existing as usize];
@@ -430,6 +472,7 @@ impl Index {
             let idx = self.push_entry(&r.name, parent, v as u8, flags);
             let map = &mut self.volumes[v].by_record;
             if rec >= map.len() {
+                reserve_vec(map, rec + 1 - map.len());
                 map.resize(rec + 1, NONE);
             }
             map[rec] = idx;
@@ -446,6 +489,7 @@ impl Index {
             return;
         }
         self.order_remove(idx);
+        self.garbage_bytes += self.entries[idx as usize].name_len as usize;
         self.entries[idx as usize].flags &= !FLAG_ALIVE;
         self.volumes[v].by_record[rec] = NONE;
         self.bump();
@@ -632,6 +676,37 @@ mod tests {
         assert_eq!(idx.full_path(i), "C:\\Windows\\z.txt");
         idx.remove('C', 14);
         assert_eq!(names(&idx, ".txt"), ["Readme.TXT"]);
+    }
+
+    #[test]
+    fn compaction() {
+        let mut idx = sample();
+        for i in 0..1000u64 {
+            idx.upsert('C', &rec(100 + i, 12, &format!("tmp{i}.dat"), false));
+        }
+        idx.upsert('C', &rec(11, 10, "renamed.exe", false));
+        for i in 0..1000u64 {
+            idx.remove('C', 100 + i);
+        }
+        idx.set_next_usn('C', 42);
+        assert_eq!(idx.dead_entries(), 1000);
+        assert!(idx.garbage_bytes > 0);
+
+        let gen_before = idx.generation.load(AtomicOrdering::Relaxed);
+        let c = idx.compacted();
+        assert_eq!(c.epoch, idx.epoch + 1);
+        assert!(c.generation.load(AtomicOrdering::Relaxed) > gen_before);
+        assert_eq!(c.dead_entries(), 0);
+        assert_eq!(c.garbage_bytes, 0);
+        assert_eq!(c.volumes[0].meta.next_usn, 42);
+        assert_eq!(names(&c, ""), names(&idx, ""));
+        let i = c.search(&Query::parse("renamed"), &|| false).unwrap()[0];
+        assert_eq!(c.full_path(i), "C:\\Windows\\renamed.exe");
+        // Live updates keep working on the compacted index.
+        let mut c = c;
+        c.upsert('C', &rec(11, 12, "renamed.exe", false));
+        let i = c.search(&Query::parse("renamed"), &|| false).unwrap()[0];
+        assert_eq!(c.full_path(i), "C:\\Users\\renamed.exe");
     }
 
     #[test]

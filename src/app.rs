@@ -53,6 +53,8 @@ pub struct SwiftFindApp {
     search_time: Duration,
     /// Index generation the current results were computed against.
     result_gen: u64,
+    /// Index epoch of `results`; entry indices from another epoch are invalid.
+    result_epoch: u64,
     rows: HashMap<u32, Row>,
     rows_gen: u64,
     focus_handle: FocusHandle,
@@ -98,6 +100,7 @@ impl SwiftFindApp {
             searching: false,
             search_time: Duration::ZERO,
             result_gen: u64::MAX,
+            result_epoch: u64::MAX,
             rows: HashMap::new(),
             rows_gen: u64::MAX,
             focus_handle: cx.focus_handle(),
@@ -116,8 +119,9 @@ impl SwiftFindApp {
             let t = Instant::now();
             let index = shared.index.read();
             let generation = index.generation.load(Ordering::Relaxed);
+            let epoch = index.epoch;
             let res = index.search(&Query::parse(&query), &|| latest.load(Ordering::Relaxed) != seq);
-            res.map(|r| (r, generation, t.elapsed()))
+            res.map(|r| (r, generation, epoch, t.elapsed()))
         });
         cx.spawn(async move |this, cx| {
             let res = task.await;
@@ -126,9 +130,10 @@ impl SwiftFindApp {
                     return;
                 }
                 this.searching = false;
-                if let Some((results, generation, elapsed)) = res {
+                if let Some((results, generation, epoch, elapsed)) = res {
                     this.results = Arc::new(results);
                     this.result_gen = generation;
+                    this.result_epoch = epoch;
                     this.search_time = elapsed;
                     if let Some(s) = this.selected {
                         if s >= this.results.len() {
@@ -174,7 +179,7 @@ impl SwiftFindApp {
     fn selected_path(&self) -> Option<String> {
         let entry = *self.results.get(self.selected?)?;
         let index = self.shared.index.read();
-        index.is_alive(entry).then(|| index.full_path(entry))
+        (index.epoch == self.result_epoch && index.is_alive(entry)).then(|| index.full_path(entry))
     }
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, _: &mut Context<Self>) {
@@ -193,6 +198,12 @@ impl SwiftFindApp {
     fn rows_for(&mut self, range: std::ops::Range<usize>) -> Vec<Option<Row>> {
         let wanted: Vec<u32> = self.results[range.clone()].to_vec();
         if let Some(index) = self.shared.index.try_read() {
+            if index.epoch != self.result_epoch {
+                // Results refer to a previous index layout; a fresh search is
+                // already on its way (generation was bumped). Show nothing.
+                self.rows.clear();
+                return vec![None; wanted.len()];
+            }
             let generation = index.generation.load(Ordering::Relaxed);
             if generation != self.rows_gen {
                 self.rows.clear();
