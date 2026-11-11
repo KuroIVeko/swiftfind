@@ -8,7 +8,7 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
-    div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
+    div, fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
 
@@ -542,9 +542,10 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
+        let t = crate::theme::get(cx);
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0., 0., 0., 0.4))
+            (input.placeholder.clone(), t.placeholder.into())
         } else {
             (content, style.color)
         };
@@ -598,7 +599,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    gpui::blue(),
+                    t.cursor,
                 )),
             )
         } else {
@@ -614,7 +615,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    t.text_selection,
                 )),
                 None,
             )
@@ -671,6 +672,7 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = crate::theme::get(cx);
         div()
             .flex()
             .key_context("TextInput")
@@ -702,9 +704,9 @@ impl Render for TextInput {
                     .w_full()
                     .px(px(8.))
                     .py(px(6.))
-                    .bg(rgb(0xffffff))
+                    .bg(t.input_bg)
                     .border_1()
-                    .border_color(rgb(0xb0b0b0))
+                    .border_color(t.input_border)
                     .rounded_sm()
                     .child(TextElement { input: cx.entity() }),
             )

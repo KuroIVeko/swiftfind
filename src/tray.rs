@@ -72,6 +72,11 @@ impl Tray {
     }
 }
 
+/// Whether another instance is already running.
+pub fn is_running() -> bool {
+    unsafe { FindWindowW(CLASS, PCWSTR::null()).is_ok_and(|h| !h.is_invalid()) }
+}
+
 /// Asks an already running instance to show its window. Returns true if one exists.
 pub fn activate_existing() -> bool {
     unsafe {

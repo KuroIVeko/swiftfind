@@ -7,10 +7,11 @@ use crate::tray::Tray;
 use crate::indexer::Shared;
 use crate::os;
 use crate::text_input::{self, Changed, TextInput};
+use crate::theme::{self, Theme};
 use gpui::{
     App, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*, px, rgb, rgba,
+    UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*, px,
     uniform_list,
 };
 use std::collections::HashMap;
@@ -92,6 +93,8 @@ struct Settings {
     recording: bool,
     /// (text, is_error)
     message: Option<(String, bool)>,
+    /// Start-at-logon state; None while it is being read or changed.
+    autostart: Option<bool>,
 }
 
 /// Open context menu for one result.
@@ -291,8 +294,39 @@ impl SwiftFindApp {
         self.menu = None;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        self.settings = Some(Settings { focus, recording: false, message: None });
+        self.settings = Some(Settings { focus, recording: false, message: None, autostart: None });
+        self.run_autostart(None, cx);
         cx.notify();
+    }
+
+    /// Reads (`None`) or changes the start-at-logon task off the UI thread;
+    /// `schtasks` takes a few hundred milliseconds.
+    fn run_autostart(&mut self, enable: Option<bool>, cx: &mut Context<Self>) {
+        if let Some(st) = self.settings.as_mut() {
+            st.autostart = None;
+        }
+        let task = cx.background_spawn(async move {
+            let result = enable.map(crate::autostart::set);
+            (result, crate::autostart::is_enabled())
+        });
+        cx.spawn(async move |this, cx| {
+            let (result, enabled) = task.await;
+            this.update(cx, |this, cx| {
+                let Some(st) = this.settings.as_mut() else { return };
+                st.autostart = Some(enabled);
+                match result {
+                    Some(Err(e)) => st.message = Some((format!("开机自启设置失败：{e}"), true)),
+                    Some(Ok(())) => {
+                        let text = if enabled { "已开启开机自动启动（启动后隐藏在托盘）" } else { "已关闭开机自动启动" };
+                        st.message = Some((text.into(), false));
+                    }
+                    None => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_settings_action(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -536,6 +570,7 @@ fn menu_item(
     cx: &mut Context<SwiftFindApp>,
     action: impl Fn(&Row, &mut Context<SwiftFindApp>) + 'static,
 ) -> impl IntoElement {
+    let t = theme::get(cx);
     div()
         .id(id)
         .flex()
@@ -545,9 +580,9 @@ fn menu_item(
         .px_3()
         .py(px(5.))
         .rounded_sm()
-        .hover(|s| s.bg(rgb(0xe5f3ff)))
+        .hover(move |s| s.bg(t.hover))
         .child(label)
-        .child(div().text_color(rgb(0x888888)).child(shortcut))
+        .child(div().text_color(t.faint).child(shortcut))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             if let Some(menu) = this.menu.take() {
                 action(&menu.row, cx);
@@ -556,8 +591,8 @@ fn menu_item(
         }))
 }
 
-fn menu_separator() -> impl IntoElement {
-    div().my_1().h(px(1.)).bg(rgb(0xe5e5e5))
+fn menu_separator(t: &Theme) -> impl IntoElement {
+    div().my_1().h(px(1.)).bg(t.separator)
 }
 
 fn cell(text: SharedString) -> gpui::Div {
@@ -571,6 +606,7 @@ impl SwiftFindApp {
             (true, false) => " ▲",
             (true, true) => " ▼",
         };
+        let t = theme::get(cx);
         div()
             .id(text)
             .flex()
@@ -581,13 +617,14 @@ impl SwiftFindApp {
             .overflow_hidden()
             .whitespace_nowrap()
             .border_r_1()
-            .border_color(rgb(0xe2e2e2))
-            .hover(|s| s.bg(rgb(0xe5f3ff)))
+            .border_color(t.divider)
+            .hover(move |s| s.bg(t.hover))
             .child(format!("{text}{arrow}"))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_sort(key, cx)))
     }
 
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme::get(cx);
         deferred(
             anchored().position(menu.position).snap_to_window().child(
                 div()
@@ -595,9 +632,10 @@ impl SwiftFindApp {
                     .occlude()
                     .min_w(px(220.))
                     .p_1()
-                    .bg(rgb(0xffffff))
+                    .bg(t.popup)
+                    .text_color(t.text)
                     .border_1()
-                    .border_color(rgb(0xcccccc))
+                    .border_color(t.popup_border)
                     .rounded_md()
                     .shadow_md()
                     .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -606,7 +644,7 @@ impl SwiftFindApp {
                     }))
                     .child(menu_item("m-open", "打开", "Enter", cx, |r, _| os::open(&r.full)))
                     .child(menu_item("m-reveal", "打开所在文件夹", "Ctrl+Enter", cx, |r, _| os::reveal(&r.full)))
-                    .child(menu_separator())
+                    .child(menu_separator(&t))
                     .child(menu_item("m-copy-full", "复制完整路径", "Ctrl+Shift+C", cx, |r, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(r.full.to_string()))
                     }))
@@ -616,7 +654,7 @@ impl SwiftFindApp {
                     .child(menu_item("m-copy-dir", "复制所在文件夹路径", "", cx, |r, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(r.path.to_string()))
                     }))
-                    .child(menu_separator())
+                    .child(menu_separator(&t))
                     .child(menu_item("m-props", "属性", "", cx, |r, _| os::properties(&r.full))),
             ),
         )
@@ -635,6 +673,7 @@ impl Render for SwiftFindApp {
         let status = self.shared.status.lock().clone();
         let count = self.results.len();
         let selected = self.selected;
+        let t = theme::get(cx);
 
         let list = uniform_list(
             "results",
@@ -657,8 +696,8 @@ impl Render for SwiftFindApp {
                             .items_center()
                             .h(px(ROW_H))
                             .w_full()
-                            .when(is_selected, |d| d.bg(rgb(0xcce8ff)))
-                            .when(!is_selected, |d| d.hover(|s| s.bg(rgb(0xe5f3ff))))
+                            .when(is_selected, |d| d.bg(t.selected))
+                            .when(!is_selected, |d| d.hover(|s| s.bg(t.hover)))
                             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                                 this.selected = Some(ix);
                                 cx.notify();
@@ -703,8 +742,8 @@ impl Render for SwiftFindApp {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0xffffff))
-            .text_color(rgb(0x1e1e1e))
+            .bg(t.bg)
+            .text_color(t.text)
             .text_size(px(13.))
             .child(
                 div()
@@ -713,7 +752,7 @@ impl Render for SwiftFindApp {
                     .items_center()
                     .gap_2()
                     .p_2()
-                    .bg(rgb(0xf3f3f3))
+                    .bg(t.chrome)
                     .child(div().flex_grow(1.).min_w_0().child(self.input.clone()))
                     .child(
                         div()
@@ -721,8 +760,8 @@ impl Render for SwiftFindApp {
                             .px_2()
                             .py_1()
                             .rounded_sm()
-                            .text_color(rgb(0x555555))
-                            .hover(|s| s.bg(rgb(0xe0e0e0)))
+                            .text_color(t.muted)
+                            .hover(|s| s.bg(t.button_hover))
                             .child("设置")
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_settings(window, cx))),
                     ),
@@ -733,10 +772,10 @@ impl Render for SwiftFindApp {
                     .flex_row()
                     .h(px(ROW_H))
                     .items_center()
-                    .bg(rgb(0xf3f3f3))
+                    .bg(t.chrome)
                     .border_b_1()
-                    .border_color(rgb(0xdddddd))
-                    .text_color(rgb(0x555555))
+                    .border_color(t.chrome_border)
+                    .text_color(t.muted)
                     .child(self.header_cell("名称", SortKey::Name, cx).flex_basis(px(0.)).flex_grow(3.).min_w_0())
                     .child(self.header_cell("路径", SortKey::Path, cx).flex_basis(px(0.)).flex_grow(5.).min_w_0())
                     .child(self.header_cell("大小", SortKey::Size, cx).w(px(COL_SIZE)).flex_none().justify_end())
@@ -752,10 +791,10 @@ impl Render for SwiftFindApp {
                     .px_2()
                     .h(px(ROW_H))
                     .items_center()
-                    .bg(rgb(0xf3f3f3))
+                    .bg(t.chrome)
                     .border_t_1()
-                    .border_color(rgb(0xdddddd))
-                    .text_color(rgb(0x555555))
+                    .border_color(t.chrome_border)
+                    .text_color(t.muted)
                     .child(format!("{count} 个对象"))
                     .child(format!(
                         "{}{status}  ·  搜索 {:.1} ms",
@@ -774,16 +813,16 @@ impl Render for SwiftFindApp {
     }
 }
 
-fn button(id: &'static str, label: impl Into<SharedString>, primary: bool) -> gpui::Stateful<gpui::Div> {
+fn button(t: &Theme, id: &'static str, label: impl Into<SharedString>, primary: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_3()
         .py_1()
         .rounded_md()
         .border_1()
-        .border_color(if primary { rgb(0x1f6fd6) } else { rgb(0xcccccc) })
-        .bg(if primary { rgb(0x1f6fd6) } else { rgb(0xffffff) })
-        .text_color(if primary { rgb(0xffffff) } else { rgb(0x1e1e1e) })
+        .border_color(if primary { t.accent } else { t.popup_border })
+        .bg(if primary { t.accent } else { t.field })
+        .text_color(if primary { t.on_accent } else { t.text })
         .hover(|s| s.opacity(0.85))
         .child(label.into())
 }
@@ -792,6 +831,7 @@ impl SwiftFindApp {
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let st = self.settings.as_ref().unwrap();
         let recording = st.recording;
+        let t = theme::get(cx);
         let key_text = if recording { "请按下新的组合键…".to_string() } else { self.hotkey.label() };
         div()
             .absolute()
@@ -801,7 +841,7 @@ impl SwiftFindApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x00000033))
+            .bg(t.overlay)
             .occlude()
             .child(
                 div()
@@ -813,8 +853,8 @@ impl SwiftFindApp {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .bg(rgb(0xffffff))
-                    .text_color(rgb(0x1e1e1e))
+                    .bg(t.popup)
+                    .text_color(t.text)
                     .text_size(px(13.))
                     .rounded_lg()
                     .shadow_lg()
@@ -834,8 +874,8 @@ impl SwiftFindApp {
                                     .py_1()
                                     .rounded_md()
                                     .border_1()
-                                    .border_color(if recording { rgb(0x1f6fd6) } else { rgb(0xcccccc) })
-                                    .bg(if recording { rgb(0xeef5ff) } else { rgb(0xfafafa) })
+                                    .border_color(if recording { t.accent } else { t.popup_border })
+                                    .bg(if recording { t.field_active } else { t.field })
                                     .text_center()
                                     .child(key_text)
                                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -848,13 +888,38 @@ impl SwiftFindApp {
                                     })),
                             ),
                     )
-                    .child(div().text_color(rgb(0x888888)).child(if recording {
+                    .child(div().text_color(t.faint).child(if recording {
                         "按 Esc 取消"
                     } else {
                         "点击右侧按钮后按下新的组合键，需包含 Ctrl / Alt / Win，或使用 F1–F24"
                     }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child("开机自动启动")
+                            .child({
+                                let state = st.autostart;
+                                let label = match state {
+                                    None => "…",
+                                    Some(true) => "已开启",
+                                    Some(false) => "已关闭",
+                                };
+                                button(&t, "autostart-toggle", label, state == Some(true))
+                                    .min_w(px(170.))
+                                    .text_center()
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        if let Some(on) = state {
+                                            this.run_autostart(Some(!on), cx);
+                                            cx.notify();
+                                        }
+                                    }))
+                            }),
+                    )
                     .when_some(st.message.clone(), |d, (text, is_error)| {
-                        d.child(div().text_color(if is_error { rgb(0xc42b1c) } else { rgb(0x107c10) }).child(text))
+                        d.child(div().text_color(if is_error { t.error } else { t.ok }).child(text))
                     })
                     .child(
                         div()
@@ -863,13 +928,13 @@ impl SwiftFindApp {
                             .justify_end()
                             .gap_2()
                             .mt_2()
-                            .child(button("hotkey-default", format!("恢复默认（{}）", Hotkey::DEFAULT.label()), false).on_click(
+                            .child(button(&t, "hotkey-default", format!("恢复默认（{}）", Hotkey::DEFAULT.label()), false).on_click(
                                 cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.apply_hotkey(Hotkey::DEFAULT);
                                     cx.notify();
                                 }),
                             ))
-                            .child(button("settings-close", "关闭", true).on_click(cx.listener(
+                            .child(button(&t, "settings-close", "关闭", true).on_click(cx.listener(
                                 |this, _: &ClickEvent, window, cx| this.close_settings(window, cx),
                             ))),
                     ),

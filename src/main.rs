@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod hotkey;
 mod index;
 mod indexer;
@@ -10,6 +11,7 @@ mod ntfs;
 mod os;
 mod persist;
 mod text_input;
+mod theme;
 mod tray;
 
 use futures::StreamExt;
@@ -38,7 +40,8 @@ fn main() {
     let diagnostic = std::env::args().any(|a| a == "--no-ui" || a == "--compare-scan" || a == "--test-launch");
     // Already running (possibly hidden in the tray): bring it up instead.
     // Done before elevating, so this needs no UAC prompt.
-    if !diagnostic && tray::activate_existing() {
+    let background = std::env::args().any(|a| a == autostart::BACKGROUND_FLAG);
+    if !diagnostic && (if background { tray::is_running() } else { tray::activate_existing() }) {
         return;
     }
 
@@ -123,9 +126,13 @@ fn main() {
                         title: Some("SwiftFind".into()),
                         ..Default::default()
                     }),
+                    // Started at logon: stay in the tray until asked for.
+                    show: !background,
+                    focus: !background,
                     ..Default::default()
                 },
                 |window, cx| {
+                    theme::follow_system(window, cx);
                     hwnd = hwnd_of(window);
                     os::window::set_icon(hwnd, tray::icon());
                     // Closing only hides to the tray; quit from the tray menu.
@@ -139,6 +146,9 @@ fn main() {
             )
             .expect("open window");
 
+        // A window opened hidden gets its size and position applied by gpui
+        // on its first activation, so that one goes through gpui.
+        let mut never_shown = background;
         cx.spawn(async move |cx| {
             while let Some(event) = events.next().await {
                 let show = match event {
@@ -155,7 +165,7 @@ fn main() {
                     }
                     TrayEvent::Toggle | TrayEvent::Show => true,
                     TrayEvent::Settings => {
-                        os::window::show(hwnd);
+                        show_window(hwnd, &mut never_shown, &main, cx);
                         main.update(cx, |app, window, cx| app.open_settings(window, cx)).ok();
                         continue;
                     }
@@ -167,12 +177,27 @@ fn main() {
                     }
                 };
                 if show {
-                    os::window::show(hwnd);
+                    show_window(hwnd, &mut never_shown, &main, cx);
                     main.update(cx, |app, window, cx| app.focus_search(window, cx)).ok();
                 }
             }
         })
         .detach();
-        cx.activate(true);
+        if !background {
+            cx.activate(true);
+        }
     });
+}
+
+fn show_window(
+    hwnd: isize,
+    never_shown: &mut bool,
+    main: &gpui::WindowHandle<app::SwiftFindApp>,
+    cx: &mut gpui::AsyncApp,
+) {
+    if std::mem::take(never_shown) {
+        main.update(cx, |_, window, _| window.activate_window()).ok();
+    } else {
+        os::window::show(hwnd);
+    }
 }
