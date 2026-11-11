@@ -109,6 +109,13 @@ impl VolumeScan {
         });
     }
 
+    /// Moves all records of `other` to the end of this scan.
+    pub fn append(&mut self, other: &VolumeScan) {
+        let base = self.names.len() as u32;
+        self.names.push_str(&other.names);
+        self.recs.extend(other.recs.iter().map(|r| ScanRec { name_off: r.name_off + base, ..*r }));
+    }
+
     pub fn name(&self, r: &ScanRec) -> &str {
         &self.names[r.name_off as usize..r.name_off as usize + r.name_len as usize]
     }

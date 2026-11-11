@@ -77,7 +77,13 @@ pub fn start(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
 fn full_scan(shared: &Shared, vol: &mut NtfsVolume) -> anyhow::Result<()> {
     shared.set_status(format!("正在索引 {}: ...", vol.letter));
     let t = Instant::now();
-    let scan = vol.enumerate()?;
+    let scan = match vol.scan_mft() {
+        Ok(scan) => scan,
+        Err(e) => {
+            log(format!("raw MFT scan of {}: failed ({e:#}), using FSCTL_ENUM_USN_DATA", vol.letter));
+            vol.enumerate()?
+        }
+    };
     let n = scan.len();
     let t_enum = t.elapsed();
     shared.index.write().add_volume(scan);
@@ -231,4 +237,50 @@ fn sync_volume(shared: &Shared, vol: &mut NtfsVolume) {
     if !changes.is_empty() {
         shared.dirty.store(true, Ordering::SeqCst);
     }
+}
+
+/// Diagnostic: scans every volume both ways and reports differences.
+pub fn compare_scans() {
+    use std::collections::HashMap;
+    for letter in ntfs_drives() {
+        let mut vol = match NtfsVolume::open(letter) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("compare {letter}: {e:#}"));
+                continue;
+            }
+        };
+        let t = Instant::now();
+        let mft = vol.scan_mft();
+        let t_mft = t.elapsed();
+        let t = Instant::now();
+        let usn = vol.enumerate();
+        let t_usn = t.elapsed();
+        let (mft, usn) = match (mft, usn) {
+            (Ok(a), Ok(b)) => (a, b),
+            (a, b) => {
+                log(format!("compare {letter}: mft {:?} / usn {:?}", a.err(), b.err()));
+                continue;
+            }
+        };
+        log(format!("compare {letter}: raw MFT {} records in {t_mft:?}, USN enum {} records in {t_usn:?}", mft.len(), usn.len()));
+        let map = |s: &VolumeScan| -> HashMap<u64, (u64, String, bool)> {
+            s.recs.iter().map(|r| (r.rec, (r.parent, s.name(r).to_owned(), r.is_dir))).collect()
+        };
+        let (a, b) = (map(&mft), map(&usn));
+        let only_mft: Vec<_> = a.iter().filter(|(k, _)| !b.contains_key(k)).collect();
+        let only_usn: Vec<_> = b.iter().filter(|(k, _)| !a.contains_key(k)).collect();
+        let differ: Vec<_> = a.iter().filter_map(|(k, v)| b.get(k).filter(|w| *w != v).map(|w| (k, v, w))).collect();
+        log(format!("  only in MFT: {}, only in USN: {}, different: {}", only_mft.len(), only_usn.len(), differ.len()));
+        for (k, v) in only_mft.iter().take(15) {
+            log(format!("  mft-only #{k}: {v:?}"));
+        }
+        for (k, v) in only_usn.iter().take(15) {
+            log(format!("  usn-only #{k}: {v:?}"));
+        }
+        for (k, v, w) in differ.iter().take(15) {
+            log(format!("  diff #{k}: mft {v:?} usn {w:?}"));
+        }
+    }
+    log("compare: done".into());
 }

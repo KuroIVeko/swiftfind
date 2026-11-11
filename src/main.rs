@@ -3,6 +3,7 @@
 mod app;
 mod index;
 mod indexer;
+mod mft;
 mod ntfs;
 mod os;
 mod persist;
@@ -21,6 +22,11 @@ fn main() {
     }
 
     let shared = Arc::new(indexer::Shared::default());
+
+    if std::env::args().any(|a| a == "--compare-scan") {
+        indexer::compare_scans();
+        return;
+    }
 
     // Diagnostic mode: build the index without any UI, log memory, and exit.
     if std::env::args().any(|a| a == "--no-ui") {

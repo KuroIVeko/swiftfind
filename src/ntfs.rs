@@ -10,14 +10,14 @@ use windows::Win32::Foundation::{
     ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     GetFileInformationByHandle, GetLogicalDrives, GetVolumeInformationW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL,
-    FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
+    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_QUERY_USN_JOURNAL,
+    FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0, NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
     USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
 };
 use windows::core::HSTRING;
@@ -173,7 +173,18 @@ impl NtfsVolume {
         ok
     }
 
-    /// Enumerates every file record on the volume.
+    /// Enumerates every file record by reading the raw MFT (fast path).
+    pub fn scan_mft(&mut self) -> Result<VolumeScan> {
+        self.query_journal()?;
+        let mut buf = [0u8; size_of::<NTFS_VOLUME_DATA_BUFFER>()];
+        unsafe { ioctl::<()>(self.handle.0, FSCTL_GET_NTFS_VOLUME_DATA, None, &mut buf) }
+            .context("FSCTL_GET_NTFS_VOLUME_DATA")?;
+        let geo: NTFS_VOLUME_DATA_BUFFER = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
+        let raw = open(&format!("\\\\.\\{}:", self.letter), FILE_FLAG_NO_BUFFERING)?;
+        crate::mft::scan(raw.0, &geo, self.letter, self.meta())
+    }
+
+    /// Enumerates every file record via `FSCTL_ENUM_USN_DATA` (slow fallback).
     pub fn enumerate(&mut self) -> Result<VolumeScan> {
         self.query_journal()?;
         let mut scan = VolumeScan::with_capacity(self.letter, self.meta(), 1 << 20, 16 << 20);
