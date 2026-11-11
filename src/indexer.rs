@@ -58,7 +58,7 @@ impl Shared {
         // the indexer thread writes, and it is either us or briefly blocked.
         let result = {
             let index = self.index.read();
-            persist::save(&persist::cache_path(), &index.live_view())
+            persist::save(&persist::cache_path(), &index)
         };
         match result {
             Ok(()) => {
@@ -118,17 +118,16 @@ fn full_scan(shared: &Shared, vol: &mut NtfsVolume) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_cache() -> Vec<VolumeScan> {
+fn load_cache() -> Option<Index> {
     let t = Instant::now();
     match persist::load(&persist::cache_path()) {
-        Ok(scans) => {
-            let n: usize = scans.iter().map(|s| s.len()).sum();
-            log(format!("loaded cache: {n} records in {:?}", t.elapsed()));
-            scans
+        Ok(index) => {
+            log(format!("loaded cache: {} live entries in {:?}", index.live_count(), t.elapsed()));
+            Some(index)
         }
         Err(e) => {
             log(format!("no usable cache: {e:#}"));
-            Vec::new()
+            None
         }
     }
 }
@@ -136,9 +135,18 @@ fn load_cache() -> Vec<VolumeScan> {
 fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
     let t_start = Instant::now();
     log("start".into());
-    let mut cached = load_cache();
+    // The cache is the finished index; install it whole, then bring each
+    // volume up to date (journal replay) or rescan it if the cache is stale.
+    if let Some(index) = load_cache() {
+        shared.index.write().install(index);
+        // The file on disk is current apart from the journal replay below;
+        // don't let the hourly check rewrite it right away.
+        *shared.save_lock.lock() = Some(Instant::now());
+    }
+    let mut cached: Vec<char> = shared.index.read().volume_letters();
     let mut volumes = Vec::new();
     let mut errors = Vec::new();
+    let mut scanned = false;
     for letter in ntfs_drives() {
         let mut vol = match NtfsVolume::open(letter) {
             Ok(v) => v,
@@ -148,35 +156,38 @@ fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
                 continue;
             }
         };
-        let from_cache = cached
-            .iter()
-            .position(|s| s.letter == letter)
-            .map(|i| cached.swap_remove(i))
-            .filter(|s| {
-                let ok = vol.resume_from(&s.meta);
-                if !ok {
-                    log(format!("cache for {letter}: is stale, rescanning"));
-                }
-                ok
-            });
-        if let Some(scan) = from_cache {
-            let t = Instant::now();
-            shared.index.write().add_volume(scan);
-            log(format!("{letter}: restored from cache in {:?}", t.elapsed()));
+        cached.retain(|&l| l != letter);
+        let meta = shared.index.read().volume_meta(letter);
+        let resumed = meta.is_some_and(|m| {
+            let ok = vol.resume_from(&m);
+            if !ok {
+                log(format!("cache for {letter}: is stale, rescanning"));
+            }
+            ok
+        });
+        if resumed {
             // Replay what happened while we weren't running.
             sync_volume(&shared, &mut vol);
             volumes.push(vol);
             continue;
         }
         match full_scan(&shared, &mut vol) {
-            Ok(()) => volumes.push(vol),
+            Ok(()) => {
+                scanned = true;
+                volumes.push(vol);
+            }
             Err(e) => {
                 log(format!("volume {letter}: {e:#}"));
                 errors.push(format!("{letter}: {e:#}"));
             }
         }
     }
-    drop(cached);
+    // Volumes in the cache that are gone (or failed to open) now.
+    for letter in cached {
+        log(format!("{letter}: no longer available, dropped from index"));
+        shared.index.write().remove_volume(letter);
+        shared.dirty.store(true, Ordering::SeqCst);
+    }
     log(format!("ready in {:?}", t_start.elapsed()));
     log(shared.index.read().memory_report());
 
@@ -186,7 +197,11 @@ fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
     } else {
         shared.set_status(format!("已索引 {letters}| 失败: {}", errors.join("; ")));
     }
-    shared.save_if_dirty();
+    // A full scan is expensive to repeat, so write it right away. Journal
+    // replays are cheap and are saved on hide / exit / hourly.
+    if scanned {
+        shared.save_if_dirty();
+    }
     if let Some(done) = on_ready {
         done();
     }

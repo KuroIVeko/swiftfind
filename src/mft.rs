@@ -412,22 +412,27 @@ pub fn scan(h: HANDLE, geo: &NTFS_VOLUME_DATA_BUFFER, letter: char, meta: Volume
 /// `$Extend`), which `FSCTL_ENUM_USN_DATA` doesn't report either. Their
 /// names are not reused, so the index won't need them for parent lookups.
 fn drop_metafiles(scan: &mut VolumeScan) {
-    const ROOT: u64 = 5;
-    const FIRST_USER_RECORD: u64 = 16;
-    let mut hidden: std::collections::HashSet<u64> = (0..FIRST_USER_RECORD).filter(|&r| r != ROOT).collect();
+    const ROOT: usize = 5;
+    const FIRST_USER_RECORD: usize = 16;
+    let max = scan.recs.iter().map(|r| r.rec as usize).max().unwrap_or(0).max(FIRST_USER_RECORD);
+    let mut hidden = vec![false; max + 1];
+    hidden[..FIRST_USER_RECORD].fill(true);
+    hidden[ROOT] = false;
+    let is_hidden = |h: &[bool], rec: u64| h.get(rec as usize).copied().unwrap_or(false);
     // $Extend's subtree is shallow ($Extend\\$RmMetadata\\$Txf\\...).
     loop {
-        let before = hidden.len();
+        let mut changed = false;
         for r in &scan.recs {
-            if hidden.contains(&r.parent) {
-                hidden.insert(r.rec);
+            if !is_hidden(&hidden, r.rec) && is_hidden(&hidden, r.parent) {
+                hidden[r.rec as usize] = true;
+                changed = true;
             }
         }
-        if hidden.len() == before {
+        if !changed {
             break;
         }
     }
-    scan.recs.retain(|r| !hidden.contains(&r.rec));
+    scan.recs.retain(|r| !is_hidden(&hidden, r.rec));
 }
 
 #[cfg(test)]

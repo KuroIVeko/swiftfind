@@ -6,6 +6,8 @@
 //! `order` holds the indices of all live entries sorted case-insensitively by
 //! name, so search results come out already sorted without a per-query sort.
 
+pub mod cache;
+
 use memchr::memmem;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -20,19 +22,74 @@ const FLAG_ROOT: u8 = 4;
 /// up by [`Index::end_batch`].
 const FLAG_PENDING: u8 = 8;
 
-#[derive(Clone, Copy)]
+/// One file or directory. Plain old data with no padding, so the on-disk
+/// cache can store `entries` as raw bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(C)]
 struct Entry {
     name_off: u32,
     parent: u32,
-    name_len: u16,
-    vol: u8,
-    flags: u8,
+    /// Unix seconds; 0 if unknown.
     mtime: u32,
-    size: u64,
+    /// Size in bytes is `size_hi << 32 | size_lo` (48 bits; all ones = unknown).
+    size_lo: u32,
+    size_hi: u16,
+    /// Name length in bytes (low 10 bits) and `FLAG_*` bits (high 6 bits).
+    meta: u16,
 }
 
 // Entry count is in the millions; keep it small.
-const _: () = assert!(size_of::<Entry>() == 24);
+const _: () = assert!(size_of::<Entry>() == 20);
+
+/// NTFS names are at most 255 UTF-16 units, i.e. at most 765 UTF-8 bytes.
+const MAX_NAME_LEN: usize = (1 << 10) - 1;
+const SIZE_UNKNOWN: u64 = (1 << 48) - 1;
+
+impl Entry {
+    fn new(name_off: u32, name_len: u16, parent: u32, flags: u8, stat: Stat) -> Entry {
+        let mut e = Entry { name_off, parent, mtime: stat.mtime, ..Default::default() };
+        e.meta = name_len | (flags as u16) << 10;
+        e.set_size(stat.size);
+        e
+    }
+
+    #[inline]
+    fn name_len(&self) -> usize {
+        (self.meta & MAX_NAME_LEN as u16) as usize
+    }
+
+    #[inline]
+    fn flags(&self) -> u8 {
+        (self.meta >> 10) as u8
+    }
+
+    fn set_flag(&mut self, f: u8) {
+        self.meta |= (f as u16) << 10;
+    }
+
+    fn clear_flag(&mut self, f: u8) {
+        self.meta &= !((f as u16) << 10);
+    }
+
+    fn set_name(&mut self, off: u32, len: u16) {
+        self.name_off = off;
+        self.meta = (self.meta & !(MAX_NAME_LEN as u16)) | len;
+    }
+
+    /// Bytes, or `u64::MAX` if unknown.
+    #[inline]
+    fn size(&self) -> u64 {
+        match (self.size_hi as u64) << 32 | self.size_lo as u64 {
+            SIZE_UNKNOWN => u64::MAX,
+            s => s,
+        }
+    }
+
+    fn set_size(&mut self, size: u64) {
+        let s = if size == u64::MAX { SIZE_UNKNOWN } else { size.min(SIZE_UNKNOWN - 1) };
+        (self.size_hi, self.size_lo) = ((s >> 32) as u16, s as u32);
+    }
+}
 
 /// File size and last-write time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +196,7 @@ impl VolumeScan {
         self.push_raw(frn, parent_frn, off, is_dir, stat);
     }
 
+    #[cfg(test)]
     pub fn push_str(&mut self, frn: u64, parent_frn: u64, name: &str, is_dir: bool, stat: Stat) {
         let off = self.names.len();
         self.names.push_str(name);
@@ -158,6 +216,9 @@ impl VolumeScan {
 
     /// Moves all records of `other` to the end of this scan.
     pub fn append(&mut self, other: &VolumeScan) {
+        // Grow by a little instead of doubling: these get to ~70 MB / ~110 MB.
+        reserve_str(&mut self.names, other.names.len());
+        reserve_vec(&mut self.recs, other.recs.len());
         let base = self.names.len() as u32;
         self.names.push_str(&other.names);
         self.recs.extend(other.recs.iter().map(|r| ScanRec { name_off: r.name_off + base, ..*r }));
@@ -169,17 +230,15 @@ impl VolumeScan {
 }
 
 /// See [`Index::live_view`].
+#[cfg(test)]
 pub struct LiveView<'a> {
     index: &'a Index,
     /// Entry index -> MFT record number (u64::MAX if unmapped).
     rec_of: Vec<u64>,
 }
 
+#[cfg(test)]
 impl LiveView<'_> {
-    pub fn volume_count(&self) -> usize {
-        self.index.volumes.len()
-    }
-
     pub fn volume(&self, v: usize) -> (char, VolumeMeta) {
         let vol = &self.index.volumes[v];
         (vol.letter, vol.meta)
@@ -211,7 +270,7 @@ impl LiveView<'_> {
                 Some(&p) if p != u64::MAX => p,
                 _ => root_rec,
             };
-            f(rec as u64, parent, index.name(idx), e.flags & FLAG_DIR != 0, index.stat(idx));
+            f(rec as u64, parent, index.name(idx), e.flags() & FLAG_DIR != 0, index.stat(idx));
         }
     }
 }
@@ -273,9 +332,9 @@ fn record_no(frn: u64) -> usize {
 }
 
 impl Index {
-    fn push_entry(&mut self, name: &str, parent: u32, vol: u8, flags: u8, stat: Stat) -> u32 {
+    fn push_entry(&mut self, name: &str, parent: u32, flags: u8, stat: Stat) -> u32 {
         let (name_off, name_len) = self.push_name(name);
-        let e = Entry { name_off, parent, name_len, vol, flags, mtime: stat.mtime, size: stat.size };
+        let e = Entry::new(name_off, name_len, parent, flags, stat);
         let idx = self.entries.len() as u32;
         reserve_vec(&mut self.entries, 1);
         self.entries.push(e);
@@ -283,7 +342,15 @@ impl Index {
     }
 
     /// Appends a name to the arena; returns (offset, length).
-    fn push_name(&mut self, name: &str) -> (u32, u16) {
+    fn push_name(&mut self, mut name: &str) -> (u32, u16) {
+        if name.len() > MAX_NAME_LEN {
+            // Can't happen on NTFS; truncate at a char boundary to stay valid.
+            let mut end = MAX_NAME_LEN;
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            name = &name[..end];
+        }
         let off = self.names.len() as u32;
         reserve_str(&mut self.names, name.len());
         self.names.push_str(name);
@@ -293,26 +360,27 @@ impl Index {
     #[inline]
     pub fn name(&self, idx: u32) -> &str {
         let e = &self.entries[idx as usize];
-        &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize]
+        &self.names[e.name_off as usize..e.name_off as usize + e.name_len()]
     }
 
     pub fn is_dir(&self, idx: u32) -> bool {
-        self.entries[idx as usize].flags & FLAG_DIR != 0
+        self.entries[idx as usize].flags() & FLAG_DIR != 0
     }
 
     pub fn stat(&self, idx: u32) -> Stat {
         let e = &self.entries[idx as usize];
-        Stat { size: e.size, mtime: e.mtime }
+        Stat { size: e.size(), mtime: e.mtime }
     }
 
     /// Updates size/mtime after a journal change (`idx` from [`Index::upsert`]
     /// or [`Index::entry_of`]).
     pub fn set_stat(&mut self, idx: u32, stat: Stat) {
         if let Some(e) = self.entries.get_mut(idx as usize)
-            && e.flags & FLAG_ALIVE != 0
-            && (e.size, e.mtime) != (stat.size, stat.mtime)
+            && e.flags() & FLAG_ALIVE != 0
+            && (e.size(), e.mtime) != (stat.size, stat.mtime)
         {
-            (e.size, e.mtime) = (stat.size, stat.mtime);
+            e.set_size(stat.size);
+            e.mtime = stat.mtime;
             self.bump();
         }
     }
@@ -331,7 +399,7 @@ impl Index {
     pub fn is_alive(&self, idx: u32) -> bool {
         self.entries
             .get(idx as usize)
-            .is_some_and(|e| e.flags & FLAG_ALIVE != 0)
+            .is_some_and(|e| e.flags() & FLAG_ALIVE != 0)
     }
 
     /// Full path of the entry, e.g. `C:\Windows\notepad.exe`.
@@ -366,7 +434,7 @@ impl Index {
             parts[n] = cur;
             n += 1;
             let e = &self.entries[cur as usize];
-            if e.flags & FLAG_ROOT != 0 {
+            if e.flags() & FLAG_ROOT != 0 {
                 break;
             }
             cur = e.parent;
@@ -392,38 +460,44 @@ impl Index {
         let letter = scan.letter;
         let existing = self.volume_index(letter);
         if let Some(v) = existing {
-            for e in self.entries.iter_mut().filter(|e| e.vol == v as u8 && e.flags & FLAG_ALIVE != 0) {
-                e.flags &= !FLAG_ALIVE;
-                self.garbage_bytes += e.name_len as usize;
-            }
+            self.kill_volume_entries(v);
         }
-        let vol = existing.unwrap_or(self.volumes.len()) as u8;
         let root_rec = record_no(scan.meta.root_frn);
-        let root = self.push_entry(&format!("{letter}:"), NONE, vol, FLAG_DIR | FLAG_ALIVE | FLAG_ROOT, Stat::UNKNOWN);
-
         let max_rec = scan.recs.iter().map(|r| r.rec as usize).chain([root_rec]).max().unwrap_or(0);
         let mut by_record = vec![NONE; max_rec + 1];
-        by_record[root_rec] = root;
 
         let first = self.entries.len();
-        reserve_vec(&mut self.entries, scan.recs.len());
-        reserve_str(&mut self.names, scan.names.len());
-        let mut parents = Vec::with_capacity(scan.recs.len());
-        for r in &scan.recs {
-            if r.rec as usize == root_rec {
+        reserve_vec(&mut self.entries, scan.recs.len() + 1);
+        let meta = scan.meta;
+        let VolumeScan { names, recs, .. } = scan;
+        // First volume: adopt the scan's name arena instead of copying it.
+        let name_base = if self.names.is_empty() {
+            self.names = names;
+            0
+        } else {
+            reserve_str(&mut self.names, names.len());
+            let base = self.names.len() as u32;
+            self.names.push_str(&names);
+            drop(names);
+            base
+        };
+        for r in &recs {
+            if r.rec as usize == root_rec || r.name_len as usize > MAX_NAME_LEN {
                 continue;
             }
             let flags = FLAG_ALIVE | if r.is_dir { FLAG_DIR } else { 0 };
-            let idx = self.push_entry(scan.name(r), NONE, vol, flags, r.stat);
+            // `parent` holds the parent's record number until all entries exist.
+            let parent = u32::try_from(r.parent).unwrap_or(NONE);
+            let idx = self.entries.len() as u32;
+            self.entries.push(Entry::new(name_base + r.name_off, r.name_len, parent, flags, r.stat));
             by_record[r.rec as usize] = idx;
-            parents.push(r.parent);
         }
-        let meta = scan.meta;
-        drop(scan);
-
-        for (i, prec) in parents.into_iter().enumerate() {
-            let p = by_record.get(prec as usize).copied().unwrap_or(NONE);
-            self.entries[first + i].parent = if p == NONE { root } else { p };
+        drop(recs);
+        let root = self.push_entry(&format!("{letter}:"), NONE, FLAG_DIR | FLAG_ALIVE | FLAG_ROOT, Stat::UNKNOWN);
+        by_record[root_rec] = root;
+        for e in &mut self.entries[first..root as usize] {
+            let p = by_record.get(e.parent as usize).copied().unwrap_or(NONE);
+            e.parent = if p == NONE { root } else { p };
         }
 
         let volume = Volume { letter, meta, root, by_record };
@@ -434,8 +508,49 @@ impl Index {
         self.rebuild_order();
     }
 
-    /// Read-only view of the live records, for writing the cache without
-    /// copying the index.
+    /// Marks every entry of volume `v` (and its root) dead.
+    fn kill_volume_entries(&mut self, v: usize) {
+        let vol = &self.volumes[v];
+        for &idx in vol.by_record.iter().chain([&vol.root]) {
+            if idx != NONE {
+                let e = &mut self.entries[idx as usize];
+                if e.flags() & FLAG_ALIVE != 0 {
+                    e.clear_flag(FLAG_ALIVE);
+                    self.garbage_bytes += e.name_len();
+                }
+            }
+        }
+    }
+
+    /// Drops a volume that is no longer present (e.g. a removed drive).
+    pub fn remove_volume(&mut self, letter: char) {
+        if let Some(v) = self.volume_index(letter) {
+            self.kill_volume_entries(v);
+            self.volumes.remove(v);
+            self.rebuild_order();
+        }
+    }
+
+    /// Letters of the indexed volumes.
+    pub fn volume_letters(&self) -> Vec<char> {
+        self.volumes.iter().map(|v| v.letter).collect()
+    }
+
+    pub fn volume_meta(&self, letter: char) -> Option<VolumeMeta> {
+        Some(self.volumes[self.volume_index(letter)?].meta)
+    }
+
+    /// Replaces this index with `fresh` (loaded from the cache), making sure
+    /// every observer sees a change.
+    pub fn install(&mut self, mut fresh: Index) {
+        fresh.epoch = self.epoch + 1;
+        fresh.tree_generation = self.tree_generation + 1;
+        fresh.generation = AtomicU64::new(self.generation.load(AtomicOrdering::Relaxed) + 1);
+        *self = fresh;
+    }
+
+    /// Read-only view of the live records (tests compare against it).
+    #[cfg(test)]
     pub fn live_view(&self) -> LiveView<'_> {
         let mut rec_of = vec![u64::MAX; self.entries.len()];
         for v in &self.volumes {
@@ -505,16 +620,23 @@ impl Index {
     /// one new names buffer plus a remap table.
     pub fn compact(&mut self) {
         let n = self.entries.len();
+        // Volume of each live entry, to re-hang orphans under the right root.
+        let mut owner = vec![0u8; n];
+        for (v, vol) in self.volumes.iter().enumerate() {
+            for &idx in vol.by_record.iter().filter(|&&i| i != NONE) {
+                owner[idx as usize] = v as u8;
+            }
+        }
         let mut remap = vec![NONE; n];
         let live_bytes = self.names.len() - self.garbage_bytes;
         let mut names = String::with_capacity(live_bytes + headroom(live_bytes));
         let mut next = 0usize;
         for i in 0..n {
             let mut e = self.entries[i];
-            if e.flags & FLAG_ALIVE == 0 {
+            if e.flags() & FLAG_ALIVE == 0 {
                 continue;
             }
-            let name = &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+            let name = &self.names[e.name_off as usize..e.name_off as usize + e.name_len()];
             e.name_off = names.len() as u32;
             names.push_str(name);
             self.entries[next] = e;
@@ -535,11 +657,18 @@ impl Index {
             }
         }
         let roots: Vec<u32> = self.volumes.iter().map(|v| v.root).collect();
-        for e in &mut self.entries {
+        let mut owner_new = vec![0u8; next];
+        for (i, &j) in remap.iter().enumerate() {
+            if j != NONE {
+                owner_new[j as usize] = owner[i];
+            }
+        }
+        drop(owner);
+        for (j, e) in self.entries.iter_mut().enumerate() {
             if e.parent != NONE {
                 // A parent that died without its children: hang under the root.
                 e.parent = match remap[e.parent as usize] {
-                    NONE => roots[e.vol as usize],
+                    NONE => roots[owner_new[j] as usize],
                     p => p,
                 };
             }
@@ -562,7 +691,7 @@ impl Index {
     fn rebuild_order(&mut self) {
         let mut order: Vec<u32> = (0..self.entries.len() as u32)
             .filter(|&i| {
-                let f = self.entries[i as usize].flags;
+                let f = self.entries[i as usize].flags();
                 f & FLAG_ALIVE != 0 && f & FLAG_ROOT == 0
             })
             .collect();
@@ -594,7 +723,7 @@ impl Index {
     fn order_insert(&mut self, idx: u32) {
         if let Some(pending) = &mut self.batch {
             pending.push(idx);
-            self.entries[idx as usize].flags |= FLAG_PENDING;
+            self.entries[idx as usize].set_flag(FLAG_PENDING);
             return;
         }
         let pos = self
@@ -619,15 +748,15 @@ impl Index {
         let Some(mut pending) = self.batch.take() else { return };
         let mut order = std::mem::take(&mut self.order);
         order.retain(|&i| {
-            let f = self.entries[i as usize].flags;
+            let f = self.entries[i as usize].flags();
             f & FLAG_ALIVE != 0 && f & FLAG_PENDING == 0
         });
         pending.sort_unstable();
         pending.dedup();
         pending.retain(|&i| {
             let e = &mut self.entries[i as usize];
-            let keep = e.flags & FLAG_ALIVE != 0;
-            e.flags &= !FLAG_PENDING;
+            let keep = e.flags() & FLAG_ALIVE != 0;
+            e.clear_flag(FLAG_PENDING);
             keep
         });
         pending.par_sort_unstable_by(|&a, &b| self.cmp_entries(a, b));
@@ -669,7 +798,7 @@ impl Index {
         let existing = self.volumes[v].by_record.get(rec).copied().unwrap_or(NONE);
 
         if existing != NONE && self.is_alive(existing) {
-            if self.entries[existing as usize].flags & FLAG_ROOT != 0 {
+            if self.entries[existing as usize].flags() & FLAG_ROOT != 0 {
                 return None;
             }
             let same_name = self.name(existing) == r.name;
@@ -678,11 +807,10 @@ impl Index {
                 return Some(existing);
             }
             if !same_name {
-                self.garbage_bytes += e.name_len as usize;
+                self.garbage_bytes += e.name_len();
                 self.order_remove(existing);
                 let (name_off, name_len) = self.push_name(&r.name);
-                let e = &mut self.entries[existing as usize];
-                (e.name_off, e.name_len) = (name_off, name_len);
+                self.entries[existing as usize].set_name(name_off, name_len);
                 self.order_insert(existing);
             }
             self.entries[existing as usize].parent = parent;
@@ -691,7 +819,7 @@ impl Index {
             Some(existing)
         } else {
             let flags = FLAG_ALIVE | if r.is_dir { FLAG_DIR } else { 0 };
-            let idx = self.push_entry(&r.name, parent, v as u8, flags, Stat::UNKNOWN);
+            let idx = self.push_entry(&r.name, parent, flags, Stat::UNKNOWN);
             let map = &mut self.volumes[v].by_record;
             if rec >= map.len() {
                 reserve_vec(map, rec + 1 - map.len());
@@ -710,12 +838,12 @@ impl Index {
         let v = self.volume_index(letter)?;
         let rec = record_no(frn);
         let idx = self.volumes[v].by_record.get(rec).copied().unwrap_or(NONE);
-        if idx == NONE || !self.is_alive(idx) || self.entries[idx as usize].flags & FLAG_ROOT != 0 {
+        if idx == NONE || !self.is_alive(idx) || self.entries[idx as usize].flags() & FLAG_ROOT != 0 {
             return None;
         }
         self.order_remove(idx);
-        self.garbage_bytes += self.entries[idx as usize].name_len as usize;
-        self.entries[idx as usize].flags &= !FLAG_ALIVE;
+        self.garbage_bytes += self.entries[idx as usize].name_len();
+        self.entries[idx as usize].clear_flag(FLAG_ALIVE);
         self.volumes[v].by_record[rec] = NONE;
         self.tree_generation += 1;
         self.bump();
@@ -748,7 +876,7 @@ impl Index {
             SortKey::Size => by(results, |i| {
                 let e = &self.entries[i as usize];
                 // Directories (no size) sort before the smallest file.
-                flip64(if e.flags & FLAG_DIR != 0 || e.size == u64::MAX { 0 } else { e.size + 1 })
+                flip64(if e.flags() & FLAG_DIR != 0 || e.size() == u64::MAX { 0 } else { e.size() + 1 })
             }),
             SortKey::Modified => by(results, |i| flip32(self.entries[i as usize].mtime)),
             SortKey::Path => {
@@ -767,7 +895,7 @@ impl Index {
     /// everything in `foo` comes right after `foo`, before `foo.bar`.
     fn dir_tree_ranks(&self) -> Vec<u32> {
         let n = self.entries.len();
-        let is_dir = |i: u32| self.entries[i as usize].flags & FLAG_DIR != 0;
+        let is_dir = |i: u32| self.entries[i as usize].flags() & FLAG_DIR != 0;
         // Directories in name order, grouped by parent (CSR layout).
         let dirs: Vec<u32> = self.order.par_iter().copied().filter(|&i| is_dir(i)).collect();
         let mut start = vec![0u32; n + 1];
@@ -836,7 +964,7 @@ impl Index {
                     let mut acc = 0u64;
                     for b in 0..(n - start).min(64) {
                         let idx = (start + b) as u32;
-                        let f = self.entries[idx as usize].flags;
+                        let f = self.entries[idx as usize].flags();
                         if f & FLAG_ALIVE != 0 && f & FLAG_ROOT == 0 && self.matches(idx, query) {
                             acc |= 1 << b;
                         }
@@ -1271,16 +1399,16 @@ mod tests {
         }
         assert_eq!(a.order, b.order);
         assert!(b.order.windows(2).all(|w| b.cmp_entries(w[0], w[1]) == Ordering::Less));
-        assert!(b.entries.iter().all(|e| e.flags & FLAG_PENDING == 0));
+        assert!(b.entries.iter().all(|e| e.flags() & FLAG_PENDING == 0));
         // Compaction keeps names and order; paths are unchanged except that
         // children of deleted directories move under the root (as before).
         let chain_alive = |idx: &Index, mut i: u32| {
             for _ in 0..128 {
                 let e = &idx.entries[i as usize];
-                if e.flags & FLAG_ALIVE == 0 {
+                if e.flags() & FLAG_ALIVE == 0 {
                     return false;
                 }
-                if e.flags & FLAG_ROOT != 0 {
+                if e.flags() & FLAG_ROOT != 0 {
                     return true;
                 }
                 i = e.parent;
@@ -1298,7 +1426,7 @@ mod tests {
                 assert_eq!(&b.full_path(i), p);
             }
             let parent = b.entries[i as usize].parent;
-            assert!(b.entries[parent as usize].flags & FLAG_ALIVE != 0);
+            assert!(b.entries[parent as usize].flags() & FLAG_ALIVE != 0);
         }
         assert!(b.order.windows(2).all(|w| b.cmp_entries(w[0], w[1]) == Ordering::Less));
     }
