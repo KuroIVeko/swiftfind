@@ -235,10 +235,7 @@ pub struct Index {
     /// Bytes of `names` no longer referenced by a live entry.
     garbage_bytes: usize,
     /// Bumped when names or parents change (not on size/time updates).
-    tree_generation: u64,
-    /// Rank of every directory by full path, for sorting by path; valid
-    /// while `tree_generation` matches.
-    path_ranks: parking_lot::Mutex<Option<(u64, std::sync::Arc<Vec<u32>>)>>,
+    pub tree_generation: u64,
 }
 
 /// Compact once at least this many entries are dead...
@@ -624,65 +621,144 @@ impl Index {
 
     /// Reorders name-sorted search results by `key`. Ties keep name order;
     /// `desc` reverses the primary key only.
+    ///
+    /// Keys are extracted once (in parallel) and sorted together with the
+    /// original position, so the comparator never touches `entries`.
     pub fn sort_results(&self, results: &mut [u32], key: SortKey, desc: bool) {
-        fn by<K: Ord + Send>(results: &mut [u32], desc: bool, key: impl Fn(u32) -> K + Sync) {
-            if desc {
-                results.par_sort_by(|&a, &b| key(b).cmp(&key(a)));
-            } else {
-                results.par_sort_by_key(|&a| key(a));
-            }
+        // Each key gets packed so that ascending order of the packed value is
+        // the wanted order; `pos` breaks ties by name.
+        fn by<K: Ord + Copy + Send + Sync>(results: &mut [u32], key: impl Fn(u32) -> K + Sync) {
+            let mut keyed: Vec<(K, u32)> =
+                results.par_iter().enumerate().map(|(pos, &i)| (key(i), pos as u32)).collect();
+            keyed.par_sort_unstable();
+            let sorted: Vec<u32> = keyed.par_iter().map(|&(_, pos)| results[pos as usize]).collect();
+            results.copy_from_slice(&sorted);
         }
+        let flip64 = |k: u64| if desc { !k } else { k };
+        let flip32 = |k: u32| if desc { !k } else { k };
         match key {
             SortKey::Name => {
                 if desc {
                     results.reverse();
                 }
             }
-            SortKey::Size => by(results, desc, |i| {
+            SortKey::Size => by(results, |i| {
                 let e = &self.entries[i as usize];
                 // Directories (no size) sort before the smallest file.
-                if e.flags & FLAG_DIR != 0 || e.size == u64::MAX { 0 } else { e.size + 1 }
+                flip64(if e.flags & FLAG_DIR != 0 || e.size == u64::MAX { 0 } else { e.size + 1 })
             }),
-            SortKey::Modified => by(results, desc, |i| self.entries[i as usize].mtime),
+            SortKey::Modified => by(results, |i| flip32(self.entries[i as usize].mtime)),
             SortKey::Path => {
-                let ranks = self.path_ranks();
-                by(results, desc, |i| {
+                let ranks = self.dir_tree_ranks();
+                by(results, |i| {
                     let p = self.entries[i as usize].parent;
-                    if p == NONE { 0 } else { ranks.get(p as usize).copied().unwrap_or(0) }
+                    flip32(if p == NONE { 0 } else { ranks[p as usize] })
                 })
             }
         }
     }
 
-    /// Entry index -> position of that directory when all directories are
-    /// sorted by full path (0 for non-directories). Cached until the tree changes.
-    fn path_ranks(&self) -> std::sync::Arc<Vec<u32>> {
-        let mut cache = self.path_ranks.lock();
-        if let Some((generation, ranks)) = &*cache
-            && *generation == self.tree_generation
-        {
-            return ranks.clone();
+    /// Entry index -> pre-order number of that directory in the directory
+    /// tree, children visited by name (0 for files and unreachable entries).
+    /// Sorting by the parent's number gives Explorer-like tree order:
+    /// everything in `foo` comes right after `foo`, before `foo.bar`.
+    fn dir_tree_ranks(&self) -> Vec<u32> {
+        let n = self.entries.len();
+        let is_dir = |i: u32| self.entries[i as usize].flags & FLAG_DIR != 0;
+        // Directories in name order, grouped by parent (CSR layout).
+        let dirs: Vec<u32> = self.order.par_iter().copied().filter(|&i| is_dir(i)).collect();
+        let mut start = vec![0u32; n + 1];
+        for &d in &dirs {
+            start[self.entries[d as usize].parent as usize + 1] += 1;
         }
-        let mut dirs: Vec<(u32, String)> = (0..self.entries.len() as u32)
-            .into_par_iter()
-            .filter(|&i| {
-                let f = self.entries[i as usize].flags;
-                f & FLAG_ALIVE != 0 && f & FLAG_DIR != 0
-            })
-            .map(|i| (i, self.build_path(i)))
-            .collect();
-        dirs.par_sort_unstable_by(|a, b| cmp_ci(&a.1, &b.1));
-        let mut ranks = vec![0u32; self.entries.len()];
-        for (rank, (i, _)) in dirs.iter().enumerate() {
-            ranks[*i as usize] = rank as u32 + 1;
+        for i in 0..n {
+            start[i + 1] += start[i];
         }
-        let ranks = std::sync::Arc::new(ranks);
-        *cache = Some((self.tree_generation, ranks.clone()));
+        let mut fill = start.clone();
+        let mut children = vec![0u32; dirs.len()];
+        for &d in &dirs {
+            let p = self.entries[d as usize].parent as usize;
+            children[fill[p] as usize] = d;
+            fill[p] += 1;
+        }
+        drop(fill);
+
+        let mut ranks = vec![0u32; n];
+        let mut next = 1u32;
+        let mut roots: Vec<(char, u32)> = self.volumes.iter().map(|v| (v.letter, v.root)).collect();
+        roots.sort();
+        let mut stack: Vec<u32> = roots.iter().rev().map(|r| r.1).collect();
+        while let Some(d) = stack.pop() {
+            ranks[d as usize] = next;
+            next += 1;
+            let (a, b) = (start[d as usize] as usize, start[d as usize + 1] as usize);
+            stack.extend(children[a..b].iter().rev());
+        }
         ranks
     }
 
+    /// Number of live entries (the result count of an empty query).
+    pub fn live_count(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Entry at `pos` in name order, for showing all entries without copying `order`.
+    pub fn order_at(&self, pos: usize) -> Option<u32> {
+        self.order.get(pos).copied()
+    }
+
     /// Runs a query. Returns `None` if cancelled via `is_cancelled`.
+    ///
+    /// Two phases: names are matched in physical (entry) order, which walks
+    /// `entries` and the names arena sequentially, setting bits; then `order`
+    /// is filtered by those bits to get name-sorted results. Walking `order`
+    /// directly would cost two cache misses per entry.
     pub fn search(&self, query: &Query, is_cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Vec<u32>> {
+        if query.terms.is_empty() {
+            return Some(self.order.clone());
+        }
+        const WORDS_PER_TASK: usize = 512; // 32K entries
+        let n = self.entries.len();
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        let completed = bits
+            .par_chunks_mut(WORDS_PER_TASK)
+            .enumerate()
+            .map(|(task, words)| {
+                if is_cancelled() {
+                    return false;
+                }
+                let first = task * WORDS_PER_TASK * 64;
+                for (w, word) in words.iter_mut().enumerate() {
+                    let start = first + w * 64;
+                    let mut acc = 0u64;
+                    for b in 0..(n - start).min(64) {
+                        let idx = (start + b) as u32;
+                        let f = self.entries[idx as usize].flags;
+                        if f & FLAG_ALIVE != 0 && f & FLAG_ROOT == 0 && self.matches(idx, query) {
+                            acc |= 1 << b;
+                        }
+                    }
+                    *word = acc;
+                }
+                true
+            })
+            .reduce(|| true, |a, b| a && b);
+        if !completed {
+            return None;
+        }
+        let hit = |i: u32| bits[i as usize / 64] >> (i % 64) & 1 != 0;
+        let chunks: Vec<Vec<u32>> =
+            self.order.par_chunks(64 * 1024).map(|c| c.iter().copied().filter(|&i| hit(i)).collect()).collect();
+        let mut out = Vec::with_capacity(chunks.iter().map(|c| c.len()).sum());
+        for c in chunks {
+            out.extend(c);
+        }
+        Some(out)
+    }
+
+    /// Previous single-pass implementation over `order`; kept as a reference
+    /// for tests and the benchmark.
+    pub fn search_by_order(&self, query: &Query, is_cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Vec<u32>> {
         if query.terms.is_empty() {
             return Some(self.order.clone());
         }
@@ -738,15 +814,21 @@ impl Index {
             .iter()
             .map(|q| {
                 let query = Query::parse(q);
-                let mut times: Vec<f64> = Vec::new();
-                let mut hits = 0;
-                for _ in 0..runs {
-                    let t = std::time::Instant::now();
-                    hits = self.search(&query, &|| false).map_or(0, |r| r.len());
-                    times.push(t.elapsed().as_secs_f64() * 1000.0);
-                }
-                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                format!("bench {q:>12}: {:7.2} ms, {hits} hits", times[times.len() / 2])
+                let median = |f: &dyn Fn() -> Vec<u32>| {
+                    let mut times: Vec<f64> = Vec::new();
+                    let mut out = Vec::new();
+                    for _ in 0..runs {
+                        let t = std::time::Instant::now();
+                        out = f();
+                        times.push(t.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    (times[times.len() / 2], out)
+                };
+                let (new_ms, new) = median(&|| self.search(&query, &|| false).unwrap());
+                let (old_ms, old) = median(&|| self.search_by_order(&query, &|| false).unwrap());
+                let same = if new == old { "same" } else { "DIFFERENT" };
+                format!("bench {q:>12}: {new_ms:7.2} ms (old {old_ms:7.2} ms), {} hits, {same}", new.len())
             })
             .collect()
     }
@@ -883,6 +965,11 @@ pub struct Query {
 }
 
 impl Query {
+    /// True for an empty query (matches every entry).
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
     pub fn parse(s: &str) -> Self {
         let lower = s.to_lowercase();
         let terms = lower
@@ -1005,6 +1092,37 @@ mod tests {
         idx.set_stat(x, st(1, 99));
         assert_eq!(sorted(&idx, SortKey::Size, false), ["x.txt", "y.txt", "z.txt"]);
         assert_eq!(idx.stat(x), st(1, 99));
+    }
+
+    #[test]
+    fn path_sort_is_tree_order() {
+        let meta = VolumeMeta { root_frn: 5, ..Default::default() };
+        let mut s = VolumeScan::new('C', meta);
+        s.push_str(10, 5, "foo", true, Stat::UNKNOWN);
+        s.push_str(11, 5, "foo.bar", true, Stat::UNKNOWN);
+        s.push_str(12, 10, "sub", true, Stat::UNKNOWN);
+        s.push_str(20, 11, "in_foobar.txt", false, Stat::UNKNOWN);
+        s.push_str(21, 12, "in_sub.txt", false, Stat::UNKNOWN);
+        s.push_str(22, 10, "in_foo.txt", false, Stat::UNKNOWN);
+        let mut idx = Index::default();
+        idx.add_volume(s);
+        let mut r = idx.search(&Query::parse(".txt"), &|| false).unwrap();
+        idx.sort_results(&mut r, SortKey::Path, false);
+        let names: Vec<_> = r.iter().map(|&i| idx.name(i)).collect();
+        // C:\foo, C:\foo\sub, then C:\foo.bar (a plain string sort puts foo.bar first).
+        assert_eq!(names, ["in_foo.txt", "in_sub.txt", "in_foobar.txt"]);
+    }
+
+    #[test]
+    fn two_phase_search_matches_reference() {
+        let mut idx = sample();
+        idx.upsert('C', &rec(20, 12, "zeta notes.txt", false));
+        idx.upsert('C', &rec(21, 10, "Alpha.TXT", false));
+        idx.remove('C', 11);
+        for q in ["", "t", "txt", "*.txt", "users\\ read", "windows\\", "zzz", "ä"] {
+            let query = Query::parse(q);
+            assert_eq!(idx.search(&query, &|| false), idx.search_by_order(&query, &|| false), "{q}");
+        }
     }
 
     #[test]

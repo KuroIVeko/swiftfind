@@ -129,6 +129,10 @@ pub mod window {
         }
     }
 
+    pub fn is_visible(hwnd: isize) -> bool {
+        unsafe { IsWindowVisible(h(hwnd)).as_bool() && !IsIconic(h(hwnd)).as_bool() }
+    }
+
     /// Whether the window is visible and the active foreground window.
     pub fn is_front(hwnd: isize) -> bool {
         unsafe { IsWindowVisible(h(hwnd)).as_bool() && !IsIconic(h(hwnd)).as_bool() && GetForegroundWindow() == h(hwnd) }

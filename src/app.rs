@@ -2,7 +2,7 @@
 //! and status bar.
 
 use crate::hotkey::{self, Hotkey};
-use crate::index::{Query, SortKey, Stat};
+use crate::index::{Index, Query, SortKey, Stat};
 use crate::tray::Tray;
 use crate::indexer::Shared;
 use crate::os;
@@ -61,6 +61,30 @@ struct Row {
     modified: SharedString,
 }
 
+/// Current result list. An empty query sorted by name is every live entry
+/// in `Index::order`, which is read in place instead of copying 11 MB.
+enum Results {
+    All { len: usize, rev: bool },
+    List(Vec<u32>),
+}
+
+impl Results {
+    fn len(&self) -> usize {
+        match self {
+            Results::All { len, .. } => *len,
+            Results::List(v) => v.len(),
+        }
+    }
+
+    fn entry(&self, pos: usize, index: &Index) -> Option<u32> {
+        match self {
+            Results::All { len, rev } if pos < *len => index.order_at(if *rev { len - 1 - pos } else { pos }),
+            Results::All { .. } => None,
+            Results::List(v) => v.get(pos).copied(),
+        }
+    }
+}
+
 /// State of the settings panel while it is open.
 struct Settings {
     focus: FocusHandle,
@@ -80,7 +104,10 @@ struct Menu {
 pub struct SwiftFindApp {
     input: Entity<TextInput>,
     shared: Arc<Shared>,
-    results: Arc<Vec<u32>>,
+    results: Arc<Results>,
+    /// Position -> entry for `Results::All`, so rows can be drawn while the
+    /// indexer holds the write lock.
+    positions: HashMap<usize, u32>,
     selected: Option<usize>,
     scroll: UniformListScrollHandle,
     /// Latest issued search; older in-flight searches cancel themselves.
@@ -89,6 +116,12 @@ pub struct SwiftFindApp {
     search_time: Duration,
     /// Index generation the current results were computed against.
     result_gen: u64,
+    /// Index tree generation (names/parents) of the current results.
+    result_tree_gen: u64,
+    /// Status text last drawn, to repaint only when it changes.
+    last_status: String,
+    /// Main window, to skip work while it is hidden in the tray.
+    hwnd: isize,
     /// Index epoch of `results`; entry indices from another epoch are invalid.
     result_epoch: u64,
     rows: HashMap<u32, Row>,
@@ -110,6 +143,7 @@ impl SwiftFindApp {
         tray: Tray,
         hotkey: Hotkey,
         notice: Option<String>,
+        hwnd: isize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -125,15 +159,7 @@ impl SwiftFindApp {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(300)).await;
-                let alive = this
-                    .update(cx, |this, cx| {
-                        let current = this.shared.index.read().generation.load(Ordering::Relaxed);
-                        if current != this.result_gen && !this.searching {
-                            this.search(cx);
-                        }
-                        cx.notify();
-                    })
-                    .is_ok();
+                let alive = this.update(cx, |this, cx| this.poll(cx)).is_ok();
                 if !alive {
                     break;
                 }
@@ -144,13 +170,17 @@ impl SwiftFindApp {
         let mut this = Self {
             input,
             shared,
-            results: Arc::new(Vec::new()),
+            results: Arc::new(Results::List(Vec::new())),
+            positions: HashMap::new(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
             search_seq: Arc::new(AtomicU64::new(0)),
             searching: false,
             search_time: Duration::ZERO,
             result_gen: u64::MAX,
+            result_tree_gen: u64::MAX,
+            last_status: String::new(),
+            hwnd,
             result_epoch: u64::MAX,
             rows: HashMap::new(),
             rows_gen: u64::MAX,
@@ -167,6 +197,37 @@ impl SwiftFindApp {
         this
     }
 
+    /// Periodic check for index changes. Re-searches only when the result set
+    /// or its order can have changed; size/mtime-only changes just repaint.
+    /// Does nothing while the window is hidden (catches up once shown).
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        if !os::window::is_visible(self.hwnd) {
+            return;
+        }
+        let Some((generation, tree_gen, epoch)) = self
+            .shared
+            .index
+            .try_read()
+            .map(|i| (i.generation.load(Ordering::Relaxed), i.tree_generation, i.epoch))
+        else {
+            return; // indexer is writing; try next tick
+        };
+        let stat_sorted = matches!(self.sort, SortKey::Size | SortKey::Modified);
+        let stale = epoch != self.result_epoch
+            || tree_gen != self.result_tree_gen
+            || (stat_sorted && generation != self.result_gen);
+        if stale && !self.searching {
+            self.search(cx);
+        } else if generation != self.rows_gen {
+            cx.notify(); // rows_for drops cached sizes/times
+        }
+        let status = self.shared.status.lock().clone();
+        if status != self.last_status {
+            self.last_status = status;
+            cx.notify();
+        }
+    }
+
     fn search(&mut self, cx: &mut Context<Self>) {
         let seq = self.search_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let latest = self.search_seq.clone();
@@ -178,10 +239,16 @@ impl SwiftFindApp {
             let t = Instant::now();
             let index = shared.index.read();
             let generation = index.generation.load(Ordering::Relaxed);
-            let epoch = index.epoch;
-            let mut res = index.search(&Query::parse(&query), &|| latest.load(Ordering::Relaxed) != seq)?;
-            index.sort_results(&mut res, sort, desc);
-            Some((res, generation, epoch, t.elapsed()))
+            let stamp = (generation, index.tree_generation, index.epoch);
+            let q = Query::parse(&query);
+            let res = if q.is_empty() && sort == SortKey::Name {
+                Results::All { len: index.live_count(), rev: desc }
+            } else {
+                let mut res = index.search(&q, &|| latest.load(Ordering::Relaxed) != seq)?;
+                index.sort_results(&mut res, sort, desc);
+                Results::List(res)
+            };
+            Some((res, stamp, t.elapsed()))
         });
         cx.spawn(async move |this, cx| {
             let res = task.await;
@@ -190,9 +257,11 @@ impl SwiftFindApp {
                     return;
                 }
                 this.searching = false;
-                if let Some((results, generation, epoch, elapsed)) = res {
+                if let Some((results, (generation, tree_gen, epoch), elapsed)) = res {
                     this.results = Arc::new(results);
+                    this.positions.clear();
                     this.result_gen = generation;
+                    this.result_tree_gen = tree_gen;
                     this.result_epoch = epoch;
                     this.search_time = elapsed;
                     if let Some(s) = this.selected {
@@ -313,7 +382,7 @@ impl SwiftFindApp {
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if self.results.is_empty() {
+        if self.results.len() == 0 {
             return;
         }
         let ix = ix.min(self.results.len() - 1);
@@ -341,8 +410,8 @@ impl SwiftFindApp {
     }
 
     fn selected_path(&self) -> Option<String> {
-        let entry = *self.results.get(self.selected?)?;
         let index = self.shared.index.read();
+        let entry = self.results.entry(self.selected?, &index)?;
         (index.epoch == self.result_epoch && index.is_alive(entry)).then(|| index.full_path(entry))
     }
 
@@ -372,12 +441,31 @@ impl SwiftFindApp {
 
     /// Builds (and caches) display data for the given result rows.
     fn rows_for(&mut self, range: std::ops::Range<usize>) -> Vec<Option<Row>> {
-        let wanted: Vec<u32> = self.results[range.clone()].to_vec();
-        if let Some(index) = self.shared.index.try_read() {
+        let range = range.start..range.end.min(self.results.len());
+        let index = self.shared.index.try_read();
+        let wanted: Vec<Option<u32>> = match (&*self.results, &index) {
+            (Results::List(v), _) => v[range.clone()].iter().map(|&e| Some(e)).collect(),
+            (all, Some(index)) => range
+                .clone()
+                .map(|pos| {
+                    let e = all.entry(pos, index);
+                    if let Some(e) = e {
+                        self.positions.insert(pos, e);
+                    }
+                    e
+                })
+                .collect(),
+            (_, None) => range.clone().map(|pos| self.positions.get(&pos).copied()).collect(),
+        };
+        if self.positions.len() > 4096 {
+            self.positions.clear();
+        }
+        if let Some(index) = index {
             if index.epoch != self.result_epoch {
                 // Results refer to a previous index layout; a fresh search is
                 // already on its way (generation was bumped). Show nothing.
                 self.rows.clear();
+                self.positions.clear();
                 return vec![None; wanted.len()];
             }
             let generation = index.generation.load(Ordering::Relaxed);
@@ -385,7 +473,7 @@ impl SwiftFindApp {
                 self.rows.clear();
                 self.rows_gen = generation;
             }
-            for &e in &wanted {
+            for &e in wanted.iter().flatten() {
                 if self.rows.contains_key(&e) || !index.is_alive(e) {
                     continue;
                 }
@@ -413,7 +501,7 @@ impl SwiftFindApp {
                 self.rows.clear();
             }
         }
-        wanted.iter().map(|e| self.rows.get(e).cloned()).collect()
+        wanted.iter().map(|e| e.and_then(|e| self.rows.get(&e).cloned())).collect()
     }
 }
 

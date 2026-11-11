@@ -65,7 +65,7 @@ fn main() {
         if std::env::args().any(|a| a == "--bench-search") {
             let queries = [
                 "", "a", "e", "win", "notepad", ".dll", "readme", "config.json", "zzqxj", "文档", "测试",
-                "*.txt", "windows\\ note",
+                "*.txt", "windows\\ note", "windows\\",
             ];
             for line in shared.index.read().bench_search(&queries, 7) {
                 indexer::log(line);
@@ -117,7 +117,7 @@ fn main() {
                         os::window::hide(hwnd);
                         false
                     });
-                    cx.new(|cx| app::SwiftFindApp::new(shared.clone(), tray, hotkey, notice, window, cx))
+                    cx.new(|cx| app::SwiftFindApp::new(shared.clone(), tray, hotkey, notice, hwnd, window, cx))
                 },
             )
             .expect("open window");
