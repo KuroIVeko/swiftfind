@@ -14,17 +14,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-actions!(everything, [SelectNext, SelectPrev, SelectFirst, SelectLast, OpenSelected, RevealSelected]);
+actions!(swiftfind, [SelectNext, SelectPrev, SelectFirst, SelectLast, OpenSelected, RevealSelected]);
 
 pub fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
     cx.bind_keys([
-        KeyBinding::new("down", SelectNext, Some("Everything")),
-        KeyBinding::new("up", SelectPrev, Some("Everything")),
-        KeyBinding::new("ctrl-home", SelectFirst, Some("Everything")),
-        KeyBinding::new("ctrl-end", SelectLast, Some("Everything")),
-        KeyBinding::new("enter", OpenSelected, Some("Everything")),
-        KeyBinding::new("ctrl-enter", RevealSelected, Some("Everything")),
+        KeyBinding::new("down", SelectNext, Some("SwiftFind")),
+        KeyBinding::new("up", SelectPrev, Some("SwiftFind")),
+        KeyBinding::new("ctrl-home", SelectFirst, Some("SwiftFind")),
+        KeyBinding::new("ctrl-end", SelectLast, Some("SwiftFind")),
+        KeyBinding::new("enter", OpenSelected, Some("SwiftFind")),
+        KeyBinding::new("ctrl-enter", RevealSelected, Some("SwiftFind")),
     ]);
 }
 
@@ -41,7 +41,7 @@ struct Row {
     modified: SharedString,
 }
 
-pub struct EverythingApp {
+pub struct SwiftFindApp {
     input: Entity<TextInput>,
     shared: Arc<Shared>,
     results: Arc<Vec<u32>>,
@@ -58,7 +58,7 @@ pub struct EverythingApp {
     focus_handle: FocusHandle,
 }
 
-impl EverythingApp {
+impl SwiftFindApp {
     pub fn new(shared: Arc<Shared>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("搜索文件名…（空格分隔多个关键词，支持 * ? 通配符）", cx));
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
@@ -258,13 +258,13 @@ fn cell(text: SharedString) -> gpui::Div {
     div().px_2().overflow_hidden().whitespace_nowrap().text_ellipsis().child(text)
 }
 
-impl Focusable for EverythingApp {
+impl Focusable for SwiftFindApp {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for EverythingApp {
+impl Render for SwiftFindApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.shared.status.lock().clone();
         let count = self.results.len();
@@ -327,7 +327,7 @@ impl Render for EverythingApp {
         .w_full();
 
         div()
-            .key_context("Everything")
+            .key_context("SwiftFind")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_prev))

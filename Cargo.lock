@@ -1135,21 +1135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "everything"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "gpui",
- "gpui_platform",
- "memchr",
- "parking_lot",
- "rayon",
- "unicode-segmentation",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "exr"
 version = "1.74.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4311,6 +4296,21 @@ dependencies = [
  "skrifa 0.37.0",
  "yazi",
  "zeno",
+]
+
+[[package]]
+name = "swiftfind"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui",
+ "gpui_platform",
+ "memchr",
+ "parking_lot",
+ "rayon",
+ "unicode-segmentation",
+ "windows 0.62.2",
 ]
 
 [[package]]

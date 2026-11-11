@@ -30,12 +30,12 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Everything".into()),
+                    title: Some("SwiftFind".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| app::EverythingApp::new(shared.clone(), window, cx)),
+            |window, cx| cx.new(|cx| app::SwiftFindApp::new(shared.clone(), window, cx)),
         )
         .expect("open window");
         let on_close = shared.clone();

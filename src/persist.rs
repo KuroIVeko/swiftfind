@@ -2,7 +2,7 @@
 //!
 //! Layout (little endian):
 //! ```text
-//! magic "EVRSIDX\0", version u32, volume count u32
+//! magic "SWFTIDX\0", version u32, volume count u32
 //! per volume:
 //!   letter u8, serial u32, root_frn u64, journal_id u64, next_usn i64,
 //!   record count u64, names byte length u64, names (UTF-8, concatenated),
@@ -15,12 +15,12 @@ use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"EVRSIDX\0";
+const MAGIC: &[u8; 8] = b"SWFTIDX\0";
 const VERSION: u32 = 1;
 
 pub fn cache_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("everything-rs").join("index.bin")
+    base.join("swiftfind").join("index.bin")
 }
 
 pub fn save(path: &Path, scans: &[VolumeScan]) -> Result<()> {
@@ -139,7 +139,7 @@ mod tests {
         let mut s = VolumeScan::new('D', meta);
         s.push_str(10, 5, "文件夹", true);
         s.push_str(11, 10, "a.txt", false);
-        let path = std::env::temp_dir().join("everything-rs-test").join("idx.bin");
+        let path = std::env::temp_dir().join("swiftfind-test").join("idx.bin");
         save(&path, &[s]).unwrap();
         let back = load(&path).unwrap();
         assert_eq!(back.len(), 1);

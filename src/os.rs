@@ -57,7 +57,7 @@ fn quote(s: &str) -> String {
 
 pub fn error_box(msg: &str) {
     unsafe {
-        MessageBoxW(None, &HSTRING::from(msg), w!("Everything"), MB_OK | MB_ICONERROR);
+        MessageBoxW(None, &HSTRING::from(msg), w!("SwiftFind"), MB_OK | MB_ICONERROR);
     }
 }
 

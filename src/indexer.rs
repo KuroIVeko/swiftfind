@@ -50,11 +50,11 @@ impl Shared {
     }
 }
 
-/// Logs to stderr and to `%TEMP%\everything.log` (release builds have no console).
+/// Logs to stderr and to `%TEMP%\swiftfind.log` (release builds have no console).
 pub fn log(msg: String) {
     use std::io::Write;
     eprintln!("{msg}");
-    let path = std::env::temp_dir().join("everything.log");
+    let path = std::env::temp_dir().join("swiftfind.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{} {msg}", chrono::Local::now().format("%H:%M:%S%.3f"));
     }
