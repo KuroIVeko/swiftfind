@@ -14,7 +14,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const SAVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The cache is ~140 MB; rewriting it every few minutes on a busy machine
+/// adds up to tens of GB a day. Save on exit, when the window is hidden (at
+/// most every `HIDE_SAVE_INTERVAL`), and at least hourly as a crash guard.
+/// A stale cache only means a longer journal replay at the next start.
+const SAVE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const HIDE_SAVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Above this many changes, `order` is fixed up once per batch.
+const BATCH_THRESHOLD: usize = 32;
 
 #[derive(Default)]
 pub struct Shared {
@@ -22,8 +29,9 @@ pub struct Shared {
     pub status: Mutex<String>,
     /// Index changed since the cache was last written.
     dirty: AtomicBool,
-    /// Serializes cache writes (indexer thread vs. exit).
-    save_lock: Mutex<()>,
+    /// Serializes cache writes (indexer thread vs. exit); holds the time of
+    /// the last successful write.
+    save_lock: Mutex<Option<Instant>>,
 }
 
 impl Shared {
@@ -31,9 +39,17 @@ impl Shared {
         *self.status.lock() = s.into();
     }
 
+    /// Like [`Shared::save_if_dirty`], but skipped if the cache was written
+    /// less than `min_age` ago.
+    pub fn save_if_older_than(&self, min_age: Duration) {
+        if self.save_lock.lock().is_none_or(|t| t.elapsed() >= min_age) {
+            self.save_if_dirty();
+        }
+    }
+
     /// Writes the index to the on-disk cache if it changed.
     pub fn save_if_dirty(&self) {
-        let _guard = self.save_lock.lock();
+        let mut last_save = self.save_lock.lock();
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -45,7 +61,10 @@ impl Shared {
             persist::save(&persist::cache_path(), &index.live_view())
         };
         match result {
-            Ok(()) => log(format!("saved cache in {:?}", t.elapsed())),
+            Ok(()) => {
+                *last_save = Some(Instant::now());
+                log(format!("saved cache in {:?}", t.elapsed()));
+            }
             Err(e) => {
                 self.dirty.store(true, Ordering::SeqCst);
                 log(format!("save cache: {e:#}"));
@@ -172,39 +191,24 @@ fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
         done();
     }
 
-    let mut last_save = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(500));
         for vol in &mut volumes {
             sync_volume(&shared, vol);
         }
-        // Only this thread mutates the index, so nothing can change between
-        // building the compacted copy and swapping it in.
         if shared.index.read().needs_compaction() {
             compact(&shared);
         }
-        if last_save.elapsed() >= SAVE_INTERVAL {
-            shared.save_if_dirty();
-            last_save = Instant::now();
-        }
+        shared.save_if_older_than(SAVE_INTERVAL);
     }
 }
 
 pub fn compact(shared: &Shared) {
     log(format!("compacting: {}", shared.index.read().memory_report()));
     let t = Instant::now();
-    let fresh = shared.index.read().compacted();
-    let t_build = t.elapsed();
-    let old = std::mem::replace(&mut *shared.index.write(), fresh);
-    // Bump after the swap so the UI re-runs its query against the new epoch.
-    shared.index.read().generation.fetch_add(1, Ordering::Relaxed);
-    drop(old);
+    shared.index.write().compact();
     shared.dirty.store(true, Ordering::SeqCst);
-    log(format!(
-        "compacted in {:?} (build {t_build:?}): {}",
-        t.elapsed(),
-        shared.index.read().memory_report()
-    ));
+    log(format!("compacted in {:?}: {}", t.elapsed(), shared.index.read().memory_report()));
 }
 
 /// Applies all pending journal entries of one volume to the index.
@@ -227,8 +231,13 @@ fn sync_volume(shared: &Shared, vol: &mut NtfsVolume) {
     // Entries whose size/mtime must be re-read: changed files, plus the
     // directories they were created in / removed from.
     let mut touched = Vec::new();
+    let t = Instant::now();
+    let batched = changes.len() > BATCH_THRESHOLD;
     {
         let mut index = shared.index.write();
+        if batched {
+            index.begin_batch();
+        }
         for c in &changes {
             match c {
                 Change::Upsert(r) => {
@@ -241,10 +250,14 @@ fn sync_volume(shared: &Shared, vol: &mut NtfsVolume) {
                 Change::Modified(frn) => touched.extend(index.entry_of(vol.letter, *frn)),
             }
         }
+        // Must finish before the write lock is released: `order` is unsorted
+        // while a batch is open.
+        index.end_batch();
         // Keep the recorded journal position in step with the applied changes, so
         // a snapshot is always consistent with the USN it claims.
         index.set_next_usn(vol.letter, vol.next_usn);
     }
+    let t_apply = t.elapsed();
     if changes.is_empty() {
         return;
     }
@@ -259,9 +272,21 @@ fn sync_volume(shared: &Shared, vol: &mut NtfsVolume) {
         touched.iter().filter(|&&i| index.is_alive(i)).map(|&i| (i, index.full_path(i))).collect()
     };
     let stats: Vec<(u32, Stat)> = paths.iter().filter_map(|(i, p)| Some((*i, Stat::from_fs(p)?))).collect();
-    let mut index = shared.index.write();
-    for (i, st) in stats {
-        index.set_stat(i, st);
+    {
+        let mut index = shared.index.write();
+        for (i, st) in stats {
+            index.set_stat(i, st);
+        }
+    }
+    if changes.len() >= 100 || t.elapsed() >= Duration::from_millis(50) {
+        log(format!(
+            "{}: applied {} changes in {t_apply:?}{} (+ stat of {} entries, total {:?})",
+            vol.letter,
+            changes.len(),
+            if batched { " batched" } else { "" },
+            touched.len(),
+            t.elapsed()
+        ));
     }
 }
 

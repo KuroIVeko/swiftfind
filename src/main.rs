@@ -26,6 +26,14 @@ fn hwnd_of(window: &Window) -> isize {
     }
 }
 
+/// Hides the window to the tray, and takes the chance to write the cache in
+/// the background (rate-limited).
+fn hide(hwnd: isize, shared: &Arc<indexer::Shared>) {
+    os::window::hide(hwnd);
+    let shared = shared.clone();
+    std::thread::spawn(move || shared.save_if_older_than(indexer::HIDE_SAVE_INTERVAL));
+}
+
 fn main() {
     let diagnostic = std::env::args().any(|a| a == "--no-ui" || a == "--compare-scan" || a == "--test-launch");
     // Already running (possibly hidden in the tray): bring it up instead.
@@ -77,9 +85,17 @@ fn main() {
                 indexer::log(line);
             }
         }
-        for i in 1..=6 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            indexer::log(format!("no-ui: idle {}ms", i * 500));
+        let args: Vec<String> = std::env::args().collect();
+        let idle_secs: u64 = args
+            .iter()
+            .position(|a| a == "--idle-secs")
+            .and_then(|i| args.get(i + 1)?.parse().ok())
+            .unwrap_or(3);
+        for i in 1..=idle_secs {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if i % 10 == 0 || i == idle_secs {
+                indexer::log(format!("no-ui: idle {i}s"));
+            }
         }
         indexer::log("no-ui: done".into());
         return;
@@ -113,8 +129,9 @@ fn main() {
                     hwnd = hwnd_of(window);
                     os::window::set_icon(hwnd, tray::icon());
                     // Closing only hides to the tray; quit from the tray menu.
+                    let on_close = shared.clone();
                     window.on_window_should_close(cx, move |_, _| {
-                        os::window::hide(hwnd);
+                        hide(hwnd, &on_close);
                         false
                     });
                     cx.new(|cx| app::SwiftFindApp::new(shared.clone(), tray, hotkey, notice, hwnd, window, cx))
@@ -133,7 +150,7 @@ fn main() {
                         continue;
                     }
                     TrayEvent::Toggle if os::window::is_front(hwnd) => {
-                        os::window::hide(hwnd);
+                        hide(hwnd, &shared);
                         false
                     }
                     TrayEvent::Toggle | TrayEvent::Show => true,

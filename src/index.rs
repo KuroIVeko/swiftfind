@@ -16,6 +16,9 @@ pub const NONE: u32 = u32::MAX;
 const FLAG_DIR: u8 = 1;
 const FLAG_ALIVE: u8 = 2;
 const FLAG_ROOT: u8 = 4;
+/// Inserted or renamed during an open batch; its place in `order` is fixed
+/// up by [`Index::end_batch`].
+const FLAG_PENDING: u8 = 8;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -183,6 +186,7 @@ impl LiveView<'_> {
     }
 
     /// (live record count, total name bytes) of volume `v`.
+    #[cfg(test)]
     pub fn stats(&self, v: usize) -> (usize, usize) {
         let (mut n, mut bytes) = (0, 0);
         self.for_each(v, |_, _, name, _, _| {
@@ -236,6 +240,8 @@ pub struct Index {
     garbage_bytes: usize,
     /// Bumped when names or parents change (not on size/time updates).
     pub tree_generation: u64,
+    /// Entries to (re)insert into `order` when the open batch ends.
+    batch: Option<Vec<u32>>,
 }
 
 /// Compact once at least this many entries are dead...
@@ -442,7 +448,8 @@ impl Index {
         LiveView { index: self, rec_of }
     }
 
-    /// Copies the live contents of every volume (used to build a compacted index).
+    /// Copies the live contents of every volume (tests compare against it).
+    #[cfg(test)]
     pub fn snapshot(&self) -> Vec<VolumeScan> {
         let view = self.live_view();
         (0..self.volumes.len())
@@ -492,19 +499,57 @@ impl Index {
             || (self.garbage_bytes >= COMPACT_MIN_GARBAGE && self.garbage_bytes * 10 >= self.names.len())
     }
 
-    /// Builds a fresh copy containing only live data. Entry indices change, so
-    /// the copy gets a new `epoch`. Safe to call under a read lock; the caller
-    /// swaps the result in.
-    pub fn compacted(&self) -> Index {
-        let mut fresh = Index {
-            epoch: self.epoch + 1,
-            generation: AtomicU64::new(self.generation.load(AtomicOrdering::Relaxed)),
-            ..Default::default()
-        };
-        for scan in self.snapshot() {
-            fresh.add_volume(scan);
+    /// Drops dead entries and stale names in place. Live entries keep their
+    /// relative order, so `order` stays sorted and is only renumbered (no
+    /// re-sort). Entry indices change, hence a new `epoch`. Extra memory is
+    /// one new names buffer plus a remap table.
+    pub fn compact(&mut self) {
+        let n = self.entries.len();
+        let mut remap = vec![NONE; n];
+        let live_bytes = self.names.len() - self.garbage_bytes;
+        let mut names = String::with_capacity(live_bytes + headroom(live_bytes));
+        let mut next = 0usize;
+        for i in 0..n {
+            let mut e = self.entries[i];
+            if e.flags & FLAG_ALIVE == 0 {
+                continue;
+            }
+            let name = &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+            e.name_off = names.len() as u32;
+            names.push_str(name);
+            self.entries[next] = e;
+            remap[i] = next as u32;
+            next += 1;
         }
-        fresh
+        self.entries.truncate(next);
+        self.entries.shrink_to(next + headroom(next));
+        self.names = names;
+        self.garbage_bytes = 0;
+
+        for v in &mut self.volumes {
+            v.root = remap[v.root as usize];
+            for slot in &mut v.by_record {
+                if *slot != NONE {
+                    *slot = remap[*slot as usize];
+                }
+            }
+        }
+        let roots: Vec<u32> = self.volumes.iter().map(|v| v.root).collect();
+        for e in &mut self.entries {
+            if e.parent != NONE {
+                // A parent that died without its children: hang under the root.
+                e.parent = match remap[e.parent as usize] {
+                    NONE => roots[e.vol as usize],
+                    p => p,
+                };
+            }
+        }
+        for o in &mut self.order {
+            *o = remap[*o as usize];
+        }
+        self.epoch += 1;
+        self.tree_generation += 1;
+        self.bump();
     }
 
     /// Records how far into the journal the index is up to date.
@@ -534,18 +579,76 @@ impl Index {
     }
 
     fn order_remove(&mut self, idx: u32) {
-        if let Ok(pos) = self.order.binary_search_by(|&o| self.cmp_entries(o, idx)) {
-            self.order.remove(pos);
+        if self.batch.is_some() {
+            return; // end_batch drops dead and pending entries in one pass
+        }
+        match self.order.binary_search_by(|&o| self.cmp_entries(o, idx)) {
+            Ok(pos) => {
+                self.order.remove(pos);
+            }
+            // Shouldn't happen; never leave a stale entry behind.
+            Err(_) => self.order.retain(|&o| o != idx),
         }
     }
 
     fn order_insert(&mut self, idx: u32) {
+        if let Some(pending) = &mut self.batch {
+            pending.push(idx);
+            self.entries[idx as usize].flags |= FLAG_PENDING;
+            return;
+        }
         let pos = self
             .order
             .binary_search_by(|&o| self.cmp_entries(o, idx))
             .unwrap_or_else(|p| p);
         reserve_vec(&mut self.order, 1);
         self.order.insert(pos, idx);
+    }
+
+    /// Starts a batch of journal changes: `order` is no longer kept sorted per
+    /// change (each insert/remove there is an O(n) memmove), but fixed up once
+    /// in [`Index::end_batch`]. `order` must not be read in between, so the
+    /// caller holds the write lock for the whole batch.
+    pub fn begin_batch(&mut self) {
+        self.batch.get_or_insert_with(Vec::new);
+    }
+
+    /// Ends a batch: drops dead and moved entries from `order` in one pass,
+    /// then merges the sorted pending entries in from the back.
+    pub fn end_batch(&mut self) {
+        let Some(mut pending) = self.batch.take() else { return };
+        let mut order = std::mem::take(&mut self.order);
+        order.retain(|&i| {
+            let f = self.entries[i as usize].flags;
+            f & FLAG_ALIVE != 0 && f & FLAG_PENDING == 0
+        });
+        pending.sort_unstable();
+        pending.dedup();
+        pending.retain(|&i| {
+            let e = &mut self.entries[i as usize];
+            let keep = e.flags & FLAG_ALIVE != 0;
+            e.flags &= !FLAG_PENDING;
+            keep
+        });
+        pending.par_sort_unstable_by(|&a, &b| self.cmp_entries(a, b));
+
+        // Insertion points by binary search (few string comparisons), then
+        // shift the runs in between with plain memory moves, back to front.
+        let at: Vec<usize> = pending
+            .par_iter()
+            .map(|&p| order.partition_point(|&o| self.cmp_entries(o, p) == Ordering::Less))
+            .collect();
+        let (old_len, add) = (order.len(), pending.len());
+        reserve_vec(&mut order, add);
+        order.resize(old_len + add, 0);
+        let mut end = old_len; // runs of `order` above `end` are already moved
+        for j in (0..add).rev() {
+            let pos = at[j];
+            order.copy_within(pos..end, pos + j + 1);
+            order[pos + j] = pending[j];
+            end = pos;
+        }
+        self.order = order;
     }
 
     fn volume_index(&self, letter: char) -> Option<usize> {
@@ -1125,6 +1228,81 @@ mod tests {
         }
     }
 
+    /// Same random journal applied per change and as batches must give the
+    /// same index.
+    #[test]
+    fn batched_updates_match_immediate() {
+        let mut seed = 12345u64;
+        let mut rand = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let words = ["a", "B", "c.txt", "Ä", "文档", "d", "z", "a.txt", "readme"];
+        let mut ops = Vec::new();
+        for _ in 0..3000 {
+            let frn = 10 + rand(200);
+            if rand(4) == 0 {
+                ops.push(Err(frn));
+            } else {
+                let parent = if rand(3) == 0 { 5 } else { 10 + rand(200) };
+                let name = format!("{}{}", words[rand(words.len() as u64) as usize], rand(5));
+                ops.push(Ok(rec(frn, parent, &name, rand(5) == 0)));
+            }
+        }
+        let apply = |idx: &mut Index, op: &Result<RawRecord, u64>| match op {
+            Ok(r) => {
+                idx.upsert('C', r);
+            }
+            Err(frn) => {
+                idx.remove('C', *frn);
+            }
+        };
+        let mut a = sample();
+        let mut b = sample();
+        for op in &ops {
+            apply(&mut a, op);
+        }
+        for chunk in ops.chunks(97) {
+            b.begin_batch();
+            for op in chunk {
+                apply(&mut b, op);
+            }
+            b.end_batch();
+        }
+        assert_eq!(a.order, b.order);
+        assert!(b.order.windows(2).all(|w| b.cmp_entries(w[0], w[1]) == Ordering::Less));
+        assert!(b.entries.iter().all(|e| e.flags & FLAG_PENDING == 0));
+        // Compaction keeps names and order; paths are unchanged except that
+        // children of deleted directories move under the root (as before).
+        let chain_alive = |idx: &Index, mut i: u32| {
+            for _ in 0..128 {
+                let e = &idx.entries[i as usize];
+                if e.flags & FLAG_ALIVE == 0 {
+                    return false;
+                }
+                if e.flags & FLAG_ROOT != 0 {
+                    return true;
+                }
+                i = e.parent;
+            }
+            false
+        };
+        let names_before: Vec<String> = b.order.iter().map(|&i| b.name(i).to_string()).collect();
+        let paths_before: Vec<Option<String>> =
+            b.order.iter().map(|&i| chain_alive(&b, i).then(|| b.full_path(i))).collect();
+        b.compact();
+        let names_after: Vec<String> = b.order.iter().map(|&i| b.name(i).to_string()).collect();
+        assert_eq!(names_after, names_before);
+        for (k, &i) in b.order.iter().enumerate() {
+            if let Some(p) = &paths_before[k] {
+                assert_eq!(&b.full_path(i), p);
+            }
+            let parent = b.entries[i as usize].parent;
+            assert!(b.entries[parent as usize].flags & FLAG_ALIVE != 0);
+        }
+        assert!(b.order.windows(2).all(|w| b.cmp_entries(w[0], w[1]) == Ordering::Less));
+    }
+
     #[test]
     fn filetime_conversion() {
         // 2024-01-01T00:00:00Z
@@ -1187,17 +1365,19 @@ mod tests {
         assert!(idx.garbage_bytes > 0);
 
         let gen_before = idx.generation.load(AtomicOrdering::Relaxed);
-        let c = idx.compacted();
-        assert_eq!(c.epoch, idx.epoch + 1);
+        let before = names(&idx, "");
+        let mut c = idx;
+        c.compact();
+        assert_eq!(c.epoch, 1);
         assert!(c.generation.load(AtomicOrdering::Relaxed) > gen_before);
         assert_eq!(c.dead_entries(), 0);
         assert_eq!(c.garbage_bytes, 0);
         assert_eq!(c.volumes[0].meta.next_usn, 42);
-        assert_eq!(names(&c, ""), names(&idx, ""));
+        assert_eq!(names(&c, ""), before);
+        assert_eq!(c.entries.len(), 5); // root + 4 files
         let i = c.search(&Query::parse("renamed"), &|| false).unwrap()[0];
         assert_eq!(c.full_path(i), "C:\\Windows\\renamed.exe");
         // Live updates keep working on the compacted index.
-        let mut c = c;
         c.upsert('C', &rec(11, 12, "renamed.exe", false));
         let i = c.search(&Query::parse("renamed"), &|| false).unwrap()[0];
         assert_eq!(c.full_path(i), "C:\\Users\\renamed.exe");
