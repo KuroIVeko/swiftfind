@@ -35,9 +35,87 @@ pub struct RawRecord {
     pub is_dir: bool,
 }
 
+/// Identity and journal position of a volume, used to validate the on-disk cache.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct VolumeMeta {
+    pub serial: u32,
+    pub root_frn: u64,
+    pub journal_id: u64,
+    /// The index reflects all journal entries before this USN.
+    pub next_usn: i64,
+}
+
+#[derive(Clone, Copy)]
+pub struct ScanRec {
+    /// MFT record number (lower 48 bits of the FRN).
+    pub rec: u64,
+    pub parent: u64,
+    pub name_off: u32,
+    pub name_len: u16,
+    pub is_dir: bool,
+}
+
+/// Compact list of all records of one volume. Produced by a full MFT scan or
+/// loaded from the on-disk cache, then consumed by [`Index::add_volume`].
+/// All names live in one string arena, so there is no per-record allocation.
+pub struct VolumeScan {
+    pub letter: char,
+    pub meta: VolumeMeta,
+    pub names: String,
+    pub recs: Vec<ScanRec>,
+}
+
+impl VolumeScan {
+    #[cfg(test)]
+    pub fn new(letter: char, meta: VolumeMeta) -> Self {
+        VolumeScan { letter, meta, names: String::new(), recs: Vec::new() }
+    }
+
+    pub fn with_capacity(letter: char, meta: VolumeMeta, recs: usize, name_bytes: usize) -> Self {
+        VolumeScan {
+            letter,
+            meta,
+            names: String::with_capacity(name_bytes),
+            recs: Vec::with_capacity(recs),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.recs.len()
+    }
+
+    /// Appends a record whose name is given as UTF-16 code units.
+    pub fn push_utf16(&mut self, frn: u64, parent_frn: u64, name: impl Iterator<Item = u16>, is_dir: bool) {
+        let off = self.names.len();
+        self.names.extend(char::decode_utf16(name).map(|c| c.unwrap_or('\u{FFFD}')));
+        self.push_raw(frn, parent_frn, off, is_dir);
+    }
+
+    pub fn push_str(&mut self, frn: u64, parent_frn: u64, name: &str, is_dir: bool) {
+        let off = self.names.len();
+        self.names.push_str(name);
+        self.push_raw(frn, parent_frn, off, is_dir);
+    }
+
+    fn push_raw(&mut self, frn: u64, parent_frn: u64, off: usize, is_dir: bool) {
+        self.recs.push(ScanRec {
+            rec: record_no(frn) as u64,
+            parent: record_no(parent_frn) as u64,
+            name_off: off as u32,
+            name_len: (self.names.len() - off) as u16,
+            is_dir,
+        });
+    }
+
+    pub fn name(&self, r: &ScanRec) -> &str {
+        &self.names[r.name_off as usize..r.name_off as usize + r.name_len as usize]
+    }
+}
+
 pub struct Volume {
     /// e.g. 'C'
     pub letter: char,
+    pub meta: VolumeMeta,
     root: u32,
     /// MFT record number (lower 48 bits of FRN) -> entry index.
     by_record: Vec<u32>,
@@ -61,21 +139,25 @@ fn record_no(frn: u64) -> usize {
 
 impl Index {
     fn push_entry(&mut self, name: &str, parent: u32, vol: u8, flags: u8) -> u32 {
-        let lower = name.to_lowercase();
-        let e = Entry {
-            name_off: self.names.len() as u32,
-            lower_off: self.lower.len() as u32,
-            parent,
-            name_len: name.len() as u16,
-            lower_len: lower.len() as u16,
-            vol,
-            flags,
-        };
-        self.names.push_str(name);
-        self.lower.push_str(&lower);
+        let (name_off, name_len, lower_off, lower_len) = self.push_names(name);
+        let e = Entry { name_off, lower_off, parent, name_len, lower_len, vol, flags };
         let idx = self.entries.len() as u32;
         self.entries.push(e);
         idx
+    }
+
+    /// Appends a name to both arenas; returns (name_off, name_len, lower_off, lower_len).
+    fn push_names(&mut self, name: &str) -> (u32, u16, u32, u16) {
+        let name_off = self.names.len() as u32;
+        let lower_off = self.lower.len() as u32;
+        self.names.push_str(name);
+        if name.is_ascii() {
+            self.lower.extend(name.bytes().map(|b| b.to_ascii_lowercase() as char));
+        } else {
+            self.lower.extend(name.chars().flat_map(char::to_lowercase));
+        }
+        let lower_len = (self.lower.len() - lower_off as usize) as u16;
+        (name_off, name.len() as u16, lower_off, lower_len)
     }
 
     #[inline]
@@ -146,9 +228,10 @@ impl Index {
         self.lower_of(a).cmp(self.lower_of(b)).then(a.cmp(&b))
     }
 
-    /// Adds a whole volume from a full MFT enumeration.
-    /// If the volume already exists (re-index after a journal reset), it is replaced.
-    pub fn add_volume(&mut self, letter: char, root_frn: u64, records: Vec<RawRecord>) {
+    /// Adds a whole volume. If the volume already exists (re-index after a
+    /// journal reset), it is replaced.
+    pub fn add_volume(&mut self, scan: VolumeScan) {
+        let letter = scan.letter;
         let existing = self.volume_index(letter);
         if let Some(v) = existing {
             for e in self.entries.iter_mut().filter(|e| e.vol == v as u8) {
@@ -156,43 +239,79 @@ impl Index {
             }
         }
         let vol = existing.unwrap_or(self.volumes.len()) as u8;
-        let root_name = format!("{letter}:");
-        let root = self.push_entry(&root_name, NONE, vol, FLAG_DIR | FLAG_ALIVE | FLAG_ROOT);
+        let root_rec = record_no(scan.meta.root_frn);
+        let root = self.push_entry(&format!("{letter}:"), NONE, vol, FLAG_DIR | FLAG_ALIVE | FLAG_ROOT);
 
-        let max_rec = records
-            .iter()
-            .map(|r| record_no(r.frn))
-            .chain(std::iter::once(record_no(root_frn)))
-            .max()
-            .unwrap_or(0);
+        let max_rec = scan.recs.iter().map(|r| r.rec as usize).chain([root_rec]).max().unwrap_or(0);
         let mut by_record = vec![NONE; max_rec + 1];
-        by_record[record_no(root_frn)] = root;
+        by_record[root_rec] = root;
 
         let first = self.entries.len();
-        self.entries.reserve(records.len());
-        let mut parent_frns = Vec::with_capacity(records.len());
-        for r in &records {
-            if record_no(r.frn) == record_no(root_frn) {
+        self.entries.reserve(scan.recs.len());
+        self.names.reserve(scan.names.len());
+        self.lower.reserve(scan.names.len());
+        let mut parents = Vec::with_capacity(scan.recs.len());
+        for r in &scan.recs {
+            if r.rec as usize == root_rec {
                 continue;
             }
             let flags = FLAG_ALIVE | if r.is_dir { FLAG_DIR } else { 0 };
-            let idx = self.push_entry(&r.name, NONE, vol, flags);
-            by_record[record_no(r.frn)] = idx;
-            parent_frns.push(r.parent_frn);
+            let idx = self.push_entry(scan.name(r), NONE, vol, flags);
+            by_record[r.rec as usize] = idx;
+            parents.push(r.parent);
         }
-        drop(records);
+        let meta = scan.meta;
+        drop(scan);
 
-        for (i, pfrn) in parent_frns.into_iter().enumerate() {
-            let p = by_record.get(record_no(pfrn)).copied().unwrap_or(NONE);
+        for (i, prec) in parents.into_iter().enumerate() {
+            let p = by_record.get(prec as usize).copied().unwrap_or(NONE);
             self.entries[first + i].parent = if p == NONE { root } else { p };
         }
 
-        let volume = Volume { letter, root, by_record };
+        let volume = Volume { letter, meta, root, by_record };
         match existing {
             Some(v) => self.volumes[v] = volume,
             None => self.volumes.push(volume),
         }
         self.rebuild_order();
+    }
+
+    /// Extracts the live contents of every volume, for writing the cache.
+    pub fn snapshot(&self) -> Vec<VolumeScan> {
+        let mut rec_of = vec![u64::MAX; self.entries.len()];
+        for v in &self.volumes {
+            for (rec, &idx) in v.by_record.iter().enumerate() {
+                if idx != NONE {
+                    rec_of[idx as usize] = rec as u64;
+                }
+            }
+        }
+        self.volumes
+            .iter()
+            .map(|v| {
+                let live = v.by_record.iter().filter(|&&i| i != NONE).count();
+                let mut scan = VolumeScan::with_capacity(v.letter, v.meta, live, live * 16);
+                for (rec, &idx) in v.by_record.iter().enumerate() {
+                    if idx == NONE || idx == v.root || !self.is_alive(idx) {
+                        continue;
+                    }
+                    let e = &self.entries[idx as usize];
+                    let parent = match rec_of.get(e.parent as usize) {
+                        Some(&p) if p != u64::MAX => p,
+                        _ => record_no(v.meta.root_frn) as u64,
+                    };
+                    scan.push_str(rec as u64, parent, self.name(idx), e.flags & FLAG_DIR != 0);
+                }
+                scan
+            })
+            .collect()
+    }
+
+    /// Records how far into the journal the index is up to date.
+    pub fn set_next_usn(&mut self, letter: char, usn: i64) {
+        if let Some(v) = self.volume_index(letter) {
+            self.volumes[v].meta.next_usn = usn;
+        }
     }
 
     fn rebuild_order(&mut self) {
@@ -253,14 +372,9 @@ impl Index {
             }
             if !same_name {
                 self.order_remove(existing);
-                let lower = r.name.to_lowercase();
+                let (name_off, name_len, lower_off, lower_len) = self.push_names(&r.name);
                 let e = &mut self.entries[existing as usize];
-                e.name_off = self.names.len() as u32;
-                e.name_len = r.name.len() as u16;
-                e.lower_off = self.lower.len() as u32;
-                e.lower_len = lower.len() as u16;
-                self.names.push_str(&r.name);
-                self.lower.push_str(&lower);
+                (e.name_off, e.name_len, e.lower_off, e.lower_len) = (name_off, name_len, lower_off, lower_len);
                 self.order_insert(existing);
             }
             self.entries[existing as usize].parent = parent;
@@ -413,17 +527,22 @@ mod tests {
 
     fn sample() -> Index {
         let mut idx = Index::default();
-        idx.add_volume(
-            'C',
-            5,
-            vec![
-                rec(10, 5, "Windows", true),
-                rec(11, 10, "notepad.exe", false),
-                rec(12, 5, "Users", true),
-                rec(13, 12, "Readme.TXT", false),
-            ],
-        );
+        idx.add_volume(scan(&[
+            (10, 5, "Windows", true),
+            (11, 10, "notepad.exe", false),
+            (12, 5, "Users", true),
+            (13, 12, "Readme.TXT", false),
+        ]));
         idx
+    }
+
+    fn scan(recs: &[(u64, u64, &str, bool)]) -> VolumeScan {
+        let meta = VolumeMeta { root_frn: 5, ..Default::default() };
+        let mut s = VolumeScan::new('C', meta);
+        for &(frn, parent, name, dir) in recs {
+            s.push_utf16(frn, parent, name.encode_utf16(), dir);
+        }
+        s
     }
 
     fn names(idx: &Index, q: &str) -> Vec<String> {
@@ -466,5 +585,27 @@ mod tests {
         assert_eq!(idx.full_path(i), "C:\\Windows\\z.txt");
         idx.remove('C', 14);
         assert_eq!(names(&idx, ".txt"), ["Readme.TXT"]);
+    }
+
+    #[test]
+    fn non_ascii_lowercase() {
+        let mut idx = Index::default();
+        idx.add_volume(scan(&[(10, 5, "Ärger 文档.TXT", false)]));
+        assert_eq!(names(&idx, "ärger 文档"), ["Ärger 文档.TXT"]);
+    }
+
+    #[test]
+    fn snapshot_roundtrip() {
+        let mut idx = sample();
+        idx.upsert('C', &rec(14, 10, "new.txt", false));
+        idx.remove('C', 13);
+        let snap = idx.snapshot();
+        let mut restored = Index::default();
+        for s in snap {
+            restored.add_volume(s);
+        }
+        assert_eq!(names(&restored, ""), ["new.txt", "notepad.exe", "Users", "Windows"]);
+        let i = restored.search(&Query::parse("new.txt"), &|| false).unwrap()[0];
+        assert_eq!(restored.full_path(i), "C:\\Windows\\new.txt");
     }
 }

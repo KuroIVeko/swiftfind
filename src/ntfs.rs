@@ -1,7 +1,7 @@
 //! NTFS volume access: full enumeration via `FSCTL_ENUM_USN_DATA` and live
 //! change tracking via `FSCTL_READ_USN_JOURNAL`. Requires administrator rights.
 
-use crate::index::RawRecord;
+use crate::index::{RawRecord, VolumeMeta, VolumeScan};
 use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -84,8 +84,11 @@ unsafe fn ioctl<I>(h: HANDLE, code: u32, input: Option<&I>, out: &mut [u8]) -> w
 pub struct NtfsVolume {
     pub letter: char,
     handle: OwnedHandle,
-    pub root_frn: u64,
+    serial: u32,
+    root_frn: u64,
     journal_id: u64,
+    /// Oldest USN still present in the journal.
+    lowest_valid_usn: i64,
     pub next_usn: i64,
 }
 
@@ -105,7 +108,21 @@ impl NtfsVolume {
         unsafe { GetFileInformationByHandle(root.0, &mut info) }.context("root file info")?;
         let root_frn = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
 
-        let mut v = NtfsVolume { letter, handle, root_frn, journal_id: 0, next_usn: 0 };
+        let mut serial = 0u32;
+        unsafe {
+            GetVolumeInformationW(&HSTRING::from(format!("{letter}:\\")), None, Some(&mut serial), None, None, None)
+        }
+        .context("volume serial")?;
+
+        let mut v = NtfsVolume {
+            letter,
+            handle,
+            serial,
+            root_frn,
+            journal_id: 0,
+            lowest_valid_usn: 0,
+            next_usn: 0,
+        };
         v.query_journal()?;
         Ok(v)
     }
@@ -128,14 +145,38 @@ impl NtfsVolume {
         }
         let data: USN_JOURNAL_DATA_V0 = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
         self.journal_id = data.UsnJournalID;
+        self.lowest_valid_usn = data.LowestValidUsn;
         self.next_usn = data.NextUsn;
         Ok(())
     }
 
+    pub fn meta(&self) -> VolumeMeta {
+        VolumeMeta {
+            serial: self.serial,
+            root_frn: self.root_frn,
+            journal_id: self.journal_id,
+            next_usn: self.next_usn,
+        }
+    }
+
+    /// If a cached index taken at `cached` can be brought up to date by
+    /// replaying the journal, rewinds the read position to it and returns true.
+    pub fn resume_from(&mut self, cached: &VolumeMeta) -> bool {
+        let ok = cached.serial == self.serial
+            && cached.root_frn == self.root_frn
+            && cached.journal_id == self.journal_id
+            && cached.next_usn >= self.lowest_valid_usn
+            && cached.next_usn <= self.next_usn;
+        if ok {
+            self.next_usn = cached.next_usn;
+        }
+        ok
+    }
+
     /// Enumerates every file record on the volume.
-    pub fn enumerate(&mut self) -> Result<Vec<RawRecord>> {
+    pub fn enumerate(&mut self) -> Result<VolumeScan> {
         self.query_journal()?;
-        let mut out = Vec::with_capacity(1 << 20);
+        let mut scan = VolumeScan::with_capacity(self.letter, self.meta(), 1 << 20, 16 << 20);
         let mut buf = vec![0u8; 1 << 20];
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: self.next_usn };
         loop {
@@ -148,9 +189,11 @@ impl NtfsVolume {
                 break;
             }
             med.StartFileReferenceNumber = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            parse_records(&buf[8..n], |r, _| out.push(r));
+            parse_records(&buf[8..n], |r| {
+                scan.push_utf16(r.frn, r.parent_frn, r.name_utf16(), r.is_dir);
+            });
         }
-        Ok(out)
+        Ok(scan)
     }
 
     /// Reads journal entries since the last call. Non-blocking.
@@ -181,11 +224,16 @@ impl NtfsVolume {
             }
             let next = i64::from_le_bytes(buf[0..8].try_into().unwrap());
             let had_records = n > 8;
-            parse_records(&buf[8..n], |r, reason| {
-                f(if reason & USN_REASON_FILE_DELETE != 0 {
+            parse_records(&buf[8..n], |r| {
+                f(if r.reason & USN_REASON_FILE_DELETE != 0 {
                     Change::Removed(r.frn)
                 } else {
-                    Change::Upsert(r)
+                    Change::Upsert(RawRecord {
+                        frn: r.frn,
+                        parent_frn: r.parent_frn,
+                        name: String::from_utf16_lossy(&r.name_utf16().collect::<Vec<_>>()),
+                        is_dir: r.is_dir,
+                    })
                 })
             });
             self.next_usn = next;
@@ -194,11 +242,6 @@ impl NtfsVolume {
             }
         }
     }
-
-    /// Re-queries the journal after a reset.
-    pub fn reset_journal(&mut self) -> Result<()> {
-        self.query_journal()
-    }
 }
 
 pub enum Change {
@@ -206,8 +249,24 @@ pub enum Change {
     Removed(u64),
 }
 
+/// A USN record borrowed from the ioctl output buffer.
+struct RecordRef<'a> {
+    frn: u64,
+    parent_frn: u64,
+    reason: u32,
+    is_dir: bool,
+    /// UTF-16LE bytes.
+    name: &'a [u8],
+}
+
+impl RecordRef<'_> {
+    fn name_utf16(&self) -> impl Iterator<Item = u16> + '_ {
+        self.name.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]))
+    }
+}
+
 /// Parses a buffer of USN_RECORD_V2 / V3 records.
-fn parse_records(mut buf: &[u8], mut f: impl FnMut(RawRecord, u32)) {
+fn parse_records<'a>(mut buf: &'a [u8], mut f: impl FnMut(RecordRef<'a>)) {
     let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
     let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
@@ -217,9 +276,8 @@ fn parse_records(mut buf: &[u8], mut f: impl FnMut(RawRecord, u32)) {
             break;
         }
         let rec = &buf[..len];
-        let major = u16_at(rec, 4);
         // (frn, parent, reason, attrs, name_len, name_off)
-        let fields = match major {
+        let fields = match u16_at(rec, 4) {
             2 if len >= 60 => Some((
                 u64_at(rec, 8),
                 u64_at(rec, 16),
@@ -238,16 +296,16 @@ fn parse_records(mut buf: &[u8], mut f: impl FnMut(RawRecord, u32)) {
             )),
             _ => None,
         };
-        if let Some((frn, parent_frn, reason, attrs, nlen, noff)) = fields {
-            if noff + nlen <= len {
-                let units: Vec<u16> = rec[noff..noff + nlen]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                let name = String::from_utf16_lossy(&units);
-                let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-                f(RawRecord { frn, parent_frn, name, is_dir }, reason);
-            }
+        if let Some((frn, parent_frn, reason, attrs, nlen, noff)) = fields
+            && noff + nlen <= len
+        {
+            f(RecordRef {
+                frn,
+                parent_frn,
+                reason,
+                is_dir: attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+                name: &rec[noff..noff + nlen],
+            });
         }
         buf = &buf[len..];
     }

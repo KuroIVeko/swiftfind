@@ -5,6 +5,7 @@ mod index;
 mod indexer;
 mod ntfs;
 mod os;
+mod persist;
 mod text_input;
 
 use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
@@ -37,8 +38,10 @@ fn main() {
             |window, cx| cx.new(|cx| app::EverythingApp::new(shared.clone(), window, cx)),
         )
         .expect("open window");
-        cx.on_window_closed(|cx, _| {
+        let on_close = shared.clone();
+        cx.on_window_closed(move |cx, _| {
             if cx.windows().is_empty() {
+                on_close.save_if_dirty();
                 cx.quit();
             }
         })

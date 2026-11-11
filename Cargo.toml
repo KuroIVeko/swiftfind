@@ -40,6 +40,10 @@ wgpu = { path = "third_party/wgpu/wgpu" }
 [patch."https://github.com/zed-industries/font-kit"]
 zed-font-kit = { path = "third_party/font-kit" }
 
+[profile.dev]
+# Our own code: light optimization so indexing isn't painfully slow in debug.
+opt-level = 1
+
 [profile.dev.package."*"]
 opt-level = 2
 
