@@ -30,6 +30,15 @@ fn main() {
         if std::env::args().any(|a| a == "--compact") {
             indexer::compact(&shared);
         }
+        if std::env::args().any(|a| a == "--bench-search") {
+            let queries = [
+                "", "a", "e", "win", "notepad", ".dll", "readme", "config.json", "zzqxj", "文档", "测试",
+                "*.txt", "windows\\ note",
+            ];
+            for line in shared.index.read().bench_search(&queries, 7) {
+                indexer::log(line);
+            }
+        }
         for i in 1..=6 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             indexer::log(format!("no-ui: idle {}ms", i * 500));

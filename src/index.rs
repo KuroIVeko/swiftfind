@@ -1,9 +1,10 @@
 //! In-memory file index shared by all NTFS volumes.
 //!
-//! Layout is kept compact: every entry is a fixed-size struct that points into
-//! two string arenas (original-case and lower-case names). `order` holds the
-//! indices of all live entries sorted by lower-case name, so search results come
-//! out already sorted without a per-query sort.
+//! Layout is kept compact: every entry is a 12-byte struct that points into a
+//! single string arena of names. Matching and sorting are case-insensitive on
+//! the fly (no lower-cased copy, which would cost ~70 MB for 3M files).
+//! `order` holds the indices of all live entries sorted case-insensitively by
+//! name, so search results come out already sorted without a per-query sort.
 
 use memchr::memmem;
 use rayon::prelude::*;
@@ -19,13 +20,14 @@ const FLAG_ROOT: u8 = 4;
 #[derive(Clone, Copy)]
 struct Entry {
     name_off: u32,
-    lower_off: u32,
     parent: u32,
     name_len: u16,
-    lower_len: u16,
     vol: u8,
     flags: u8,
 }
+
+// Entry count is in the millions; keep it small.
+const _: () = assert!(size_of::<Entry>() == 12);
 
 /// A raw record coming from the MFT / USN journal.
 pub struct RawRecord {
@@ -172,7 +174,6 @@ pub struct Volume {
 pub struct Index {
     entries: Vec<Entry>,
     names: String,
-    lower: String,
     order: Vec<u32>,
     volumes: Vec<Volume>,
     /// Bumped on every mutation so the UI knows when to refresh.
@@ -214,35 +215,20 @@ fn record_no(frn: u64) -> usize {
 
 impl Index {
     fn push_entry(&mut self, name: &str, parent: u32, vol: u8, flags: u8) -> u32 {
-        let (name_off, name_len, lower_off, lower_len) = self.push_names(name);
-        let e = Entry { name_off, lower_off, parent, name_len, lower_len, vol, flags };
+        let (name_off, name_len) = self.push_name(name);
+        let e = Entry { name_off, parent, name_len, vol, flags };
         let idx = self.entries.len() as u32;
         reserve_vec(&mut self.entries, 1);
         self.entries.push(e);
         idx
     }
 
-    /// Appends a name to both arenas; returns (name_off, name_len, lower_off, lower_len).
-    fn push_names(&mut self, name: &str) -> (u32, u16, u32, u16) {
-        let name_off = self.names.len() as u32;
-        let lower_off = self.lower.len() as u32;
-        // Lower-casing can grow a name (e.g. 'İ' -> "i̇"), at most ~1.5x.
+    /// Appends a name to the arena; returns (offset, length).
+    fn push_name(&mut self, name: &str) -> (u32, u16) {
+        let off = self.names.len() as u32;
         reserve_str(&mut self.names, name.len());
-        reserve_str(&mut self.lower, name.len() * 3 / 2 + 4);
         self.names.push_str(name);
-        if name.is_ascii() {
-            self.lower.extend(name.bytes().map(|b| b.to_ascii_lowercase() as char));
-        } else {
-            self.lower.extend(name.chars().flat_map(char::to_lowercase));
-        }
-        let lower_len = (self.lower.len() - lower_off as usize) as u16;
-        (name_off, name.len() as u16, lower_off, lower_len)
-    }
-
-    #[inline]
-    fn lower_of(&self, idx: u32) -> &str {
-        let e = &self.entries[idx as usize];
-        &self.lower[e.lower_off as usize..e.lower_off as usize + e.lower_len as usize]
+        (off, name.len() as u16)
     }
 
     #[inline]
@@ -263,7 +249,7 @@ impl Index {
 
     /// Full path of the entry, e.g. `C:\Windows\notepad.exe`.
     pub fn full_path(&self, idx: u32) -> String {
-        self.build_path(idx, false)
+        self.build_path(idx)
     }
 
     /// Path of the directory containing the entry, e.g. `C:\Windows`.
@@ -272,39 +258,45 @@ impl Index {
         if p == NONE {
             return String::new();
         }
-        self.build_path(p, false)
+        self.build_path(p)
     }
 
-    fn build_path(&self, idx: u32, lower: bool) -> String {
-        let mut parts: Vec<&str> = Vec::with_capacity(16);
+    fn build_path(&self, idx: u32) -> String {
+        let mut s = String::new();
+        self.build_path_into(idx, &mut s);
+        s
+    }
+
+    /// Writes the full path of `idx` into `s` (cleared first), without allocating
+    /// once `s` has grown to path size.
+    fn build_path_into(&self, idx: u32, s: &mut String) {
+        s.clear();
+        let mut parts: [u32; 128] = [NONE; 128];
+        let mut n = 0;
         let mut cur = idx;
-        // Guard against cycles caused by inconsistent journal data.
-        for _ in 0..512 {
-            if cur == NONE {
-                break;
-            }
-            parts.push(if lower { self.lower_of(cur) } else { self.name(cur) });
+        // Bounded walk also guards against cycles from inconsistent journal data.
+        while cur != NONE && n < parts.len() {
+            parts[n] = cur;
+            n += 1;
             let e = &self.entries[cur as usize];
             if e.flags & FLAG_ROOT != 0 {
                 break;
             }
             cur = e.parent;
         }
-        let mut s = String::with_capacity(parts.iter().map(|p| p.len() + 1).sum());
-        for (i, p) in parts.iter().rev().enumerate() {
+        for (i, &p) in parts[..n].iter().rev().enumerate() {
             if i > 0 {
                 s.push('\\');
             }
-            s.push_str(p);
+            s.push_str(self.name(p));
         }
-        if parts.len() == 1 {
+        if n == 1 {
             s.push('\\'); // bare root: "C:\"
         }
-        s
     }
 
     fn cmp_entries(&self, a: u32, b: u32) -> Ordering {
-        self.lower_of(a).cmp(self.lower_of(b)).then(a.cmp(&b))
+        cmp_ci(self.name(a), self.name(b)).then(a.cmp(&b))
     }
 
     /// Adds a whole volume. If the volume already exists (re-index after a
@@ -329,7 +321,6 @@ impl Index {
         let first = self.entries.len();
         reserve_vec(&mut self.entries, scan.recs.len());
         reserve_str(&mut self.names, scan.names.len());
-        reserve_str(&mut self.lower, scan.names.len() + scan.names.len() / 64);
         let mut parents = Vec::with_capacity(scan.recs.len());
         for r in &scan.recs {
             if r.rec as usize == root_rec {
@@ -391,7 +382,6 @@ impl Index {
         let parts = [
             ("entries", self.entries.capacity() * size_of::<Entry>()),
             ("names", self.names.capacity()),
-            ("lower", self.lower.capacity()),
             ("order", self.order.capacity() * 4),
             ("by_record", by_record),
         ];
@@ -505,9 +495,9 @@ impl Index {
             if !same_name {
                 self.garbage_bytes += e.name_len as usize;
                 self.order_remove(existing);
-                let (name_off, name_len, lower_off, lower_len) = self.push_names(&r.name);
+                let (name_off, name_len) = self.push_name(&r.name);
                 let e = &mut self.entries[existing as usize];
-                (e.name_off, e.name_len, e.lower_off, e.lower_len) = (name_off, name_len, lower_off, lower_len);
+                (e.name_off, e.name_len) = (name_off, name_len);
                 self.order_insert(existing);
             }
             self.entries[existing as usize].parent = parent;
@@ -562,15 +552,26 @@ impl Index {
     }
 
     fn matches(&self, idx: u32, q: &Query) -> bool {
-        let name = self.lower_of(idx);
-        let mut path: Option<String> = None;
+        thread_local! {
+            static PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        let name = self.name(idx);
+        // Terms are sorted name-first, so the path is only built for entries
+        // whose name already matched.
+        let mut path_built = false;
         for t in &q.terms {
-            let hay: &str = if t.on_path {
-                path.get_or_insert_with(|| self.build_path(idx, true))
+            let ok = if t.on_path {
+                PATH.with_borrow_mut(|path| {
+                    if !path_built {
+                        self.build_path_into(idx, path);
+                        path_built = true;
+                    }
+                    t.matcher.is_match(path)
+                })
             } else {
-                name
+                t.matcher.is_match(name)
             };
-            if !t.matcher.is_match(hay) {
+            if !ok {
                 return false;
             }
         }
@@ -578,16 +579,96 @@ impl Index {
     }
 }
 
+/// Diagnostic: times real searches (median of `runs`).
+impl Index {
+    pub fn bench_search(&self, queries: &[&str], runs: usize) -> Vec<String> {
+        queries
+            .iter()
+            .map(|q| {
+                let query = Query::parse(q);
+                let mut times: Vec<f64> = Vec::new();
+                let mut hits = 0;
+                for _ in 0..runs {
+                    let t = std::time::Instant::now();
+                    hits = self.search(&query, &|| false).map_or(0, |r| r.len());
+                    times.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                format!("bench {q:>12}: {:7.2} ms, {hits} hits", times[times.len() / 2])
+            })
+            .collect()
+    }
+}
+
+/// Case-insensitive total order on names, consistent with byte order of the
+/// lower-cased strings (so ASCII and non-ASCII names interleave correctly).
+fn cmp_ci(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        for (x, y) in a.iter().zip(b) {
+            match x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()) {
+                Ordering::Equal => {}
+                o => return o,
+            }
+        }
+        a.len().cmp(&b.len())
+    } else {
+        a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
+    }
+}
+
+/// Case-insensitive substring test without a pre-lowered copy of `hay`.
+/// `needle` must already be lower-case.
+fn ci_contains(hay: &str, needle: &[u8], finder: &memmem::Finder) -> bool {
+    if hay.is_ascii() {
+        if !needle.is_ascii() {
+            return false;
+        }
+        ascii_ci_find(hay.as_bytes(), needle)
+    } else {
+        finder.find(hay.to_lowercase().as_bytes()).is_some()
+    }
+}
+
+fn ascii_ci_find(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > hay.len() {
+        return false;
+    }
+    let (lo, up) = (needle[0], needle[0].to_ascii_uppercase());
+    let last_start = hay.len() - needle.len();
+    let mut pos = 0;
+    while let Some(off) = memchr::memchr2(lo, up, &hay[pos..=last_start]) {
+        let start = pos + off;
+        if hay[start + 1..start + needle.len()].eq_ignore_ascii_case(&needle[1..]) {
+            return true;
+        }
+        pos = start + 1;
+        if pos > last_start {
+            break;
+        }
+    }
+    false
+}
+
 enum Matcher {
-    Substr(memmem::Finder<'static>),
-    Glob(Vec<char>),
+    /// Lower-case needle and a finder for it.
+    Substr(Vec<u8>, memmem::Finder<'static>),
+    /// Lower-case pattern, as chars and (if ASCII) as bytes for a fast path.
+    Glob(Vec<char>, Option<Vec<u8>>),
 }
 
 impl Matcher {
+    /// Case-insensitive match against an original-case `hay`.
     fn is_match(&self, hay: &str) -> bool {
         match self {
-            Matcher::Substr(f) => f.find(hay.as_bytes()).is_some(),
-            Matcher::Glob(p) => glob_match(p, hay),
+            Matcher::Substr(needle, f) => ci_contains(hay, needle, f),
+            Matcher::Glob(chars, ascii) => match ascii {
+                Some(p) if hay.is_ascii() => glob_match_by(p, hay.as_bytes(), |a, b| a == b.to_ascii_lowercase()),
+                _ => glob_match(chars, hay),
+            },
         }
     }
 }
@@ -613,32 +694,42 @@ impl Query {
                 let t = t.replace('/', "\\");
                 let on_path = t.contains('\\');
                 let matcher = if t.contains('*') || t.contains('?') {
-                    Matcher::Glob(t.chars().collect())
+                    Matcher::Glob(t.chars().collect(), t.is_ascii().then(|| t.as_bytes().to_vec()))
                 } else {
-                    Matcher::Substr(memmem::Finder::new(t.as_bytes()).into_owned())
+                    Matcher::Substr(t.as_bytes().to_vec(), memmem::Finder::new(t.as_bytes()).into_owned())
                 };
                 Term { matcher, on_path }
             })
-            .collect();
+            .collect::<Vec<Term>>();
+        let mut terms = terms;
+        // Cheap name terms first; path terms need a path to be built.
+        terms.sort_by_key(|t| t.on_path);
         Query { terms }
     }
 }
 
-/// Iterative wildcard match supporting `*` and `?` over chars.
+/// Wildcard match over chars. `pattern` must be lower-case; `text` is
+/// lower-cased here (allocates; the ASCII fast path in `Matcher` avoids this).
 fn glob_match(pattern: &[char], text: &str) -> bool {
-    let text: Vec<char> = text.chars().collect();
+    let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    glob_match_by(pattern, &text, |a, b| a == b)
+}
+
+/// Iterative wildcard match supporting `*` and `?`. `eq(pattern_elem, text_elem)`.
+fn glob_match_by<T: Copy + PartialEq + From<u8>>(pattern: &[T], text: &[T], eq: impl Fn(T, T) -> bool) -> bool {
+    let (star, any) = (T::from(b'*'), T::from(b'?'));
     let (mut p, mut t) = (0usize, 0usize);
-    let mut star: Option<usize> = None;
+    let mut star_at: Option<usize> = None;
     let mut mark = 0usize;
     while t < text.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+        if p < pattern.len() && pattern[p] != star && (pattern[p] == any || eq(pattern[p], text[t])) {
             p += 1;
             t += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
-            star = Some(p);
+        } else if p < pattern.len() && pattern[p] == star {
+            star_at = Some(p);
             mark = t;
             p += 1;
-        } else if let Some(s) = star {
+        } else if let Some(s) = star_at {
             p = s + 1;
             mark += 1;
             t = mark;
@@ -646,7 +737,7 @@ fn glob_match(pattern: &[char], text: &str) -> bool {
             return false;
         }
     }
-    while p < pattern.len() && pattern[p] == '*' {
+    while p < pattern.len() && pattern[p] == star {
         p += 1;
     }
     p == pattern.len()
@@ -695,6 +786,12 @@ mod tests {
         assert!(!glob_match(&p, "readme.txt.bak"));
         let p: Vec<char> = "n?tepad*".chars().collect();
         assert!(glob_match(&p, "notepad.exe"));
+        assert!(glob_match(&p, "NOTEPAD.EXE"));
+        let eq = |a: u8, b: u8| a == b.to_ascii_lowercase();
+        assert!(glob_match_by(b"*.txt", b"README.TXT", eq));
+        assert!(glob_match_by(b"a*b*c", b"AxxBxxC", eq));
+        assert!(!glob_match_by(b"a*b*c", b"AxxBxx", eq));
+        assert!(glob_match_by(b"*", b"", eq));
     }
 
     #[test]
@@ -751,6 +848,29 @@ mod tests {
         c.upsert('C', &rec(11, 12, "renamed.exe", false));
         let i = c.search(&Query::parse("renamed"), &|| false).unwrap()[0];
         assert_eq!(c.full_path(i), "C:\\Users\\renamed.exe");
+    }
+
+    #[test]
+    fn case_insensitive_everywhere() {
+        let idx = sample();
+        assert_eq!(names(&idx, "NOTEPAD"), ["notepad.exe"]);
+        assert_eq!(names(&idx, "*.TXT"), ["Readme.TXT"]);
+        assert_eq!(names(&idx, "WINDOWS\\ NOTE"), ["notepad.exe"]);
+        assert_eq!(names(&idx, "users\\*.txt"), Vec::<String>::new()); // glob matches whole path
+        assert_eq!(names(&idx, "c:\\users\\*.txt"), ["Readme.TXT"]);
+        assert!(ascii_ci_find(b"ABCabc", b"cab"));
+        assert!(!ascii_ci_find(b"ab", b"abc"));
+        assert!(ascii_ci_find(b"xAAB", b"aab"));
+    }
+
+    #[test]
+    fn ci_order_is_consistent() {
+        let mut v = vec!["b", "A", "a", "Ä", "z", "文", "B", "ab"];
+        v.sort_by(|a, b| cmp_ci(a, b));
+        let lowered: Vec<String> = v.iter().map(|s| s.to_lowercase()).collect();
+        let mut sorted = lowered.clone();
+        sorted.sort();
+        assert_eq!(lowered, sorted);
     }
 
     #[test]
