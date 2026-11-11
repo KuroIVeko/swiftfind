@@ -74,3 +74,18 @@ pub fn reveal(path: &str) {
         .raw_arg(format!("/select,\"{path}\""))
         .spawn();
 }
+
+/// (private bytes, working set, peak working set) of this process, in MB.
+pub fn memory_mb() -> (u64, u64, u64) {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
+    unsafe {
+        let _ = GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+            size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        );
+    }
+    let mb = |b: usize| (b / (1024 * 1024)) as u64;
+    (mb(c.PrivateUsage), mb(c.WorkingSetSize), mb(c.PeakWorkingSetSize))
+}

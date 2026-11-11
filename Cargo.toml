@@ -26,6 +26,7 @@ features = [
     "Win32_Security",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_ProcessStatus",
 ]
 
 # Same patches Zed's own workspace applies; gpui relies on them.

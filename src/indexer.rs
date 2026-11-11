@@ -40,7 +40,9 @@ impl Shared {
         let t = Instant::now();
         let snapshot = self.index.read().snapshot();
         let t_snap = t.elapsed();
-        match persist::save(&persist::cache_path(), &snapshot) {
+        let result = persist::save(&persist::cache_path(), &snapshot);
+        drop(snapshot);
+        match result {
             Ok(()) => log(format!("saved cache in {:?} (snapshot {t_snap:?})", t.elapsed())),
             Err(e) => {
                 self.dirty.store(true, Ordering::SeqCst);
@@ -53,6 +55,8 @@ impl Shared {
 /// Logs to stderr and to `%TEMP%\swiftfind.log` (release builds have no console).
 pub fn log(msg: String) {
     use std::io::Write;
+    let (private, ws, peak) = crate::os::memory_mb();
+    let msg = format!("{msg}  [private {private} MB, ws {ws} MB, peak ws {peak} MB]");
     eprintln!("{msg}");
     let path = std::env::temp_dir().join("swiftfind.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -60,10 +64,11 @@ pub fn log(msg: String) {
     }
 }
 
-pub fn start(shared: Arc<Shared>) {
+/// Starts the indexer thread. `on_ready` runs once the initial index is built.
+pub fn start(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
     std::thread::Builder::new()
         .name("indexer".into())
-        .spawn(move || run(shared))
+        .spawn(move || run(shared, on_ready))
         .expect("spawn indexer thread");
 }
 
@@ -101,8 +106,9 @@ fn load_cache() -> Vec<VolumeScan> {
     }
 }
 
-fn run(shared: Arc<Shared>) {
+fn run(shared: Arc<Shared>, on_ready: Option<Box<dyn FnOnce() + Send>>) {
     let t_start = Instant::now();
+    log("start".into());
     let mut cached = load_cache();
     let mut volumes = Vec::new();
     let mut errors = Vec::new();
@@ -145,6 +151,7 @@ fn run(shared: Arc<Shared>) {
     }
     drop(cached);
     log(format!("ready in {:?}", t_start.elapsed()));
+    log(shared.index.read().memory_report());
 
     let letters: String = volumes.iter().map(|v| format!("{}: ", v.letter)).collect();
     if errors.is_empty() {
@@ -153,6 +160,9 @@ fn run(shared: Arc<Shared>) {
         shared.set_status(format!("已索引 {letters}| 失败: {}", errors.join("; ")));
     }
     shared.save_if_dirty();
+    if let Some(done) = on_ready {
+        done();
+    }
 
     let mut last_save = Instant::now();
     loop {

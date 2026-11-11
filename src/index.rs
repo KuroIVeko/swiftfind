@@ -132,6 +132,24 @@ pub struct Index {
     pub generation: AtomicU64,
 }
 
+/// Spare capacity kept after growing: ~3% instead of the default doubling,
+/// which would commit hundreds of MB for a multi-million entry index.
+fn headroom(len: usize) -> usize {
+    len / 32 + 4096
+}
+
+fn reserve_vec<T>(v: &mut Vec<T>, extra: usize) {
+    if v.capacity() - v.len() < extra {
+        v.reserve_exact(extra + headroom(v.len()));
+    }
+}
+
+fn reserve_str(s: &mut String, extra: usize) {
+    if s.capacity() - s.len() < extra {
+        s.reserve_exact(extra + headroom(s.len()));
+    }
+}
+
 #[inline]
 fn record_no(frn: u64) -> usize {
     (frn & 0x0000_FFFF_FFFF_FFFF) as usize
@@ -142,6 +160,7 @@ impl Index {
         let (name_off, name_len, lower_off, lower_len) = self.push_names(name);
         let e = Entry { name_off, lower_off, parent, name_len, lower_len, vol, flags };
         let idx = self.entries.len() as u32;
+        reserve_vec(&mut self.entries, 1);
         self.entries.push(e);
         idx
     }
@@ -150,6 +169,9 @@ impl Index {
     fn push_names(&mut self, name: &str) -> (u32, u16, u32, u16) {
         let name_off = self.names.len() as u32;
         let lower_off = self.lower.len() as u32;
+        // Lower-casing can grow a name (e.g. 'İ' -> "i̇"), at most ~1.5x.
+        reserve_str(&mut self.names, name.len());
+        reserve_str(&mut self.lower, name.len() * 3 / 2 + 4);
         self.names.push_str(name);
         if name.is_ascii() {
             self.lower.extend(name.bytes().map(|b| b.to_ascii_lowercase() as char));
@@ -247,9 +269,9 @@ impl Index {
         by_record[root_rec] = root;
 
         let first = self.entries.len();
-        self.entries.reserve(scan.recs.len());
-        self.names.reserve(scan.names.len());
-        self.lower.reserve(scan.names.len());
+        reserve_vec(&mut self.entries, scan.recs.len());
+        reserve_str(&mut self.names, scan.names.len());
+        reserve_str(&mut self.lower, scan.names.len() + scan.names.len() / 64);
         let mut parents = Vec::with_capacity(scan.recs.len());
         for r in &scan.recs {
             if r.rec as usize == root_rec {
@@ -307,6 +329,28 @@ impl Index {
             .collect()
     }
 
+    /// Approximate heap usage of the index data structures, by component (MB).
+    pub fn memory_report(&self) -> String {
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        let by_record: usize = self.volumes.iter().map(|v| v.by_record.capacity() * 4).sum();
+        let parts = [
+            ("entries", self.entries.capacity() * size_of::<Entry>()),
+            ("names", self.names.capacity()),
+            ("lower", self.lower.capacity()),
+            ("order", self.order.capacity() * 4),
+            ("by_record", by_record),
+        ];
+        let total: usize = parts.iter().map(|p| p.1).sum();
+        let detail: Vec<String> = parts.iter().map(|(n, b)| format!("{n} {:.1}", mb(*b))).collect();
+        format!(
+            "index heap {:.1} MB ({}), {} entries ({} live)",
+            mb(total),
+            detail.join(", "),
+            self.entries.len(),
+            self.order.len()
+        )
+    }
+
     /// Records how far into the journal the index is up to date.
     pub fn set_next_usn(&mut self, letter: char, usn: i64) {
         if let Some(v) = self.volume_index(letter) {
@@ -322,6 +366,8 @@ impl Index {
             })
             .collect();
         order.par_sort_unstable_by(|&a, &b| self.cmp_entries(a, b));
+        order.shrink_to_fit();
+        order.reserve_exact(headroom(order.len()));
         self.order = order;
         self.bump();
     }
@@ -341,6 +387,7 @@ impl Index {
             .order
             .binary_search_by(|&o| self.cmp_entries(o, idx))
             .unwrap_or_else(|p| p);
+        reserve_vec(&mut self.order, 1);
         self.order.insert(pos, idx);
     }
 

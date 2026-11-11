@@ -21,7 +21,21 @@ fn main() {
     }
 
     let shared = Arc::new(indexer::Shared::default());
-    indexer::start(shared.clone());
+
+    // Diagnostic mode: build the index without any UI, log memory, and exit.
+    if std::env::args().any(|a| a == "--no-ui") {
+        let (tx, rx) = std::sync::mpsc::channel();
+        indexer::start(shared.clone(), Some(Box::new(move || tx.send(()).unwrap())));
+        rx.recv().ok();
+        for i in 1..=6 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            indexer::log(format!("no-ui: idle {}ms", i * 500));
+        }
+        indexer::log("no-ui: done".into());
+        return;
+    }
+
+    indexer::start(shared.clone(), None);
 
     gpui_platform::application().run(move |cx: &mut App| {
         app::bind_keys(cx);
